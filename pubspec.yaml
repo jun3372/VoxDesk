@@ -1,0 +1,60 @@
+name: voxdesk
+description: "离线语音工作台（sherpa-onnx + FireRedAsr2 + Silero VAD + Pyannote + 3D-Speaker）"
+publish_to: 'none'
+
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.13.3
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  cupertino_icons: ^1.0.8
+
+  # 离线语音引擎：ASR(FireRedAsr2) / VAD(Silero) / 说话人分离(Pyannote+3D-Speaker) / 标点
+  sherpa_onnx: ^1.13.8
+  # 麦克风采集（16kHz PCM16 流）
+  record: ^7.1.1
+  # 音频文件解码（MP3/M4A/FLAC/OGG/WAV -> PCM，原生平台 API）
+  audio_decoder: ^0.8.1
+  # 转写结果音频回放
+  audioplayers: ^6.4.0
+  # 文件/目录选择
+  file_picker: ^12.3.0
+  # DOCX 导出（纯 Dart 生成 OOXML zip 包）
+  archive: ^4.0.0
+  # 桌面端拖放文件
+  desktop_drop: ^0.8.4
+  path_provider: ^2.1.5
+  provider: ^6.1.5
+  window_manager: ^0.5.2
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+
+  flutter_lints: ^6.0.0
+
+flutter:
+  uses-material-design: true
+
+  assets:
+    - assets/images/
+
+  # 内嵌默认字体 MiSans（免费商用，见 assets/fonts/）：目标 Linux 机
+  # （云桌面/精简 UOS）可能没有任何系统中文字体，全靠内嵌字体避免文字
+  # 变豆腐块；Heavy 本体为 w900，声明为 800 用于承接代码里的 FontWeight.w800。
+  fonts:
+    - family: MiSans
+      fonts:
+        - asset: assets/fonts/MiSans-Regular.ttf
+        - asset: assets/fonts/MiSans-Medium.ttf
+          weight: 500
+        - asset: assets/fonts/MiSans-Demibold.ttf
+          weight: 600
+        - asset: assets/fonts/MiSans-Bold.ttf
+          weight: 700
+        - asset: assets/fonts/MiSans-Heavy.ttf
+          weight: 800

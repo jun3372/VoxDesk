@@ -1,0 +1,332 @@
+# 三平台打包并发布 GitHub Release
+#
+# 流水线骨架参照 sherpa-onnx 官方 Flutter 打包配置
+# （.github/workflows/flutter-linux.yaml / flutter-macos.yaml / flutter-windows-x64.yaml，
+#   https://github.com/k2-fsa/sherpa-onnx）：
+#   - flutter-actions/setup-flutter 固定 SDK 版本 + cache
+#   - 推送 v* 标签触发，workflow_dispatch 手动触发
+#   - concurrency 并发组避免重复构建
+#
+# 结合本仓库的两点差异做了适配：
+#   1. Linux 产物要求 glibc ≤ 2.28（兼容统信 UOS 20）：ubuntu-latest 的 glibc
+#      是 2.39，直接构建的产物在 UOS 上无法运行，因此整个 job 在 debian:buster
+#      容器（glibc 2.28）中执行，系统依赖清单与 docker/linux-builder.Dockerfile
+#      保持一致，并额外用 objdump 校验产物的最高 GLIBC 符号版本；
+#   2. 产物内置约 1.5GB 离线模型：先跑 scripts/download_models.sh（Windows 用
+#      .ps1），构建后由 scripts/bundle_models.sh 拷进 bundle，发布件为
+#      「应用 + 模型」一体包。
+#
+# 用法：
+#   发布：git tag v1.0.0 && git push origin v1.0.0（标签须与 pubspec.yaml 的
+#         version 字段一致，不一致会构建失败）
+#   试构建：Actions 页面手动 workflow_dispatch——只产出构建工件，不创建 Release。
+#
+# 注意：每个发布件约 1.4GB（模型为不可压缩数据），构建工件保留 5 天；
+#       GitHub Release 单文件上限 2GiB，当前体积在限额内。
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write # 发布 Release 需要写权限
+
+env:
+  # 与 pubspec.yaml（sdk: ^3.13.3）及本地 .flutter 克隆一致的 stable 版本
+  FLUTTER_VERSION: '3.47.4'
+
+jobs:
+  # ---------------- Linux x64（glibc 2.28：debian:buster 容器内构建） ----------------
+  build-linux:
+    name: Linux x64 (glibc 2.28)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    container:
+      # glibc 2.28，与 UOS 20 对齐；更高版本容器（如 ubuntu:24.04 / glibc 2.39）
+      # 构建的产物无法在 UOS 20 上运行
+      image: debian:buster
+
+    steps:
+      # buster 已 EOL：deb.debian.org 不再提供服务，换 archive.debian.org 归档源，
+      # 并豁免 Release 文件过期检查（基础镜像尚无 ca-certificates，apt 走 http，
+      # 完整性由 Release 文件的 GPG 签名保证）
+      - name: 配置 apt 归档源并安装依赖（buster 已 EOL）
+        run: |
+          printf '%s\n' \
+            'deb http://archive.debian.org/debian buster main' \
+            'deb http://archive.debian.org/debian-security buster/updates main' \
+            > /etc/apt/sources.list
+          apt-get -o Acquire::Check-Valid-Until=false update
+          # 与 docker/linux-builder.Dockerfile 保持同一份系统依赖清单；
+          # sudo 备用（GitHub Actions 里部分 action 内部会调 sudo）
+          apt-get install -y --no-install-recommends \
+            clang build-essential pkg-config libgtk-3-dev liblzma-dev \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            libpulse-dev libasound2-dev \
+            git curl ca-certificates unzip xz-utils zip python3-pip sudo
+          git config --global --add safe.directory '*'
+
+      - name: 安装新版 cmake / ninja（buster 自带 cmake 3.13 过旧）
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install cmake ninja
+
+      - uses: actions/checkout@v4
+
+      - uses: flutter-actions/setup-flutter@v4
+        with:
+          channel: stable
+          version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      - name: flutter 版本信息
+        run: |
+          flutter --version
+          flutter doctor
+
+      - name: 下载离线模型（约 1.5GB）
+        run: |
+          ./scripts/download_models.sh
+          test -f "models/sherpa-onnx-fire-red-asr2-zh_en-int8-2026-02-26/encoder.int8.onnx"
+
+      - name: 构建并打包
+        run: |
+          flutter pub get
+          # objective_c 的 hook 在 Linux 下无产物时不会创建该目录，但生成的
+          # cmake_install.cmake 又无条件引用它，必须预建（同 Makefile）
+          mkdir -p build/native_assets/linux
+          flutter build linux --release
+
+          BUNDLE=$(find build/linux -type d -path '*release/bundle' | head -1)
+          [ -n "$BUNDLE" ] || { echo "✗ 未找到 Linux 构建产物"; exit 1; }
+          ./scripts/bundle_models.sh "$BUNDLE"
+
+          # 换成 UOS 兼容启动器（默认软件渲染，不依赖 EGL）
+          mv "$BUNDLE/voxdesk" "$BUNDLE/voxdesk.bin"
+          cp docker/linux-launcher.sh "$BUNDLE/voxdesk"
+          chmod +x "$BUNDLE/voxdesk"
+
+          # 校验产物最高 GLIBC 符号依赖 ≤ 2.28（兼容 UOS 20 的红线）
+          MAX=0
+          for so in "$BUNDLE/voxdesk.bin" "$BUNDLE"/lib/*.so; do
+            [ -e "$so" ] || continue
+            M=$(objdump -T "$so" | grep -oE 'GLIBC_[0-9.]+' | sed 's/^GLIBC_//' | sort -uV | tail -1)
+            echo "$(basename "$so"): 最高 GLIBC_${M:-none}"
+            [ -n "$M" ] && MAX=$M
+          done
+          if [ "$(printf '%s\n' '2.28' "$MAX" | sort -V | tail -1)" != "2.28" ]; then
+            echo "✗ 产物依赖 GLIBC_$MAX，超出 2.28 上限"; exit 1
+          fi
+
+          VER=$(sed -nE 's/^version:[[:space:]]*([0-9.]+).*/\1/p' pubspec.yaml | head -1)
+          VER=${VER:-dev}
+          if [ "${{ github.ref_type }}" = "tag" ] && [ "${{ github.ref_name }}" != "v$VER" ]; then
+            echo "✗ 标签 ${{ github.ref_name }} 与 pubspec.yaml 版本 v$VER 不一致，请修正后重新打标签"; exit 1
+          fi
+
+          # 容器内新构建的文件不带 macOS 扩展属性，无需 --no-xattrs
+          mv "$BUNDLE" "$(dirname "$BUNDLE")/voxdesk"
+          tar --exclude='._*' --exclude='.DS_Store' \
+            -czf "build/voxdesk-linux-x64-v$VER.tar.gz" -C "$(dirname "$BUNDLE")" voxdesk
+          echo "✓ 已生成 build/voxdesk-linux-x64-v$VER.tar.gz"
+          du -sh "build/voxdesk-linux-x64-v$VER.tar.gz"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: voxdesk-linux-x64
+          path: build/voxdesk-linux-*.tar.gz
+          retention-days: 5
+          if-no-files-found: error
+          compression-level: 0 # tar.gz 已压缩，避免二次压缩浪费时间
+
+  # ---------------- macOS（Apple Silicon） ----------------
+  build-macos:
+    name: macOS arm64
+    runs-on: macos-latest # arm64；Intel 版需 x86_64 runner（macos-13 已退役），从源码自建
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: flutter-actions/setup-flutter@v4
+        with:
+          channel: stable
+          version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      - name: flutter 版本信息
+        run: |
+          flutter --version
+          flutter doctor
+
+      - name: 下载离线模型（约 1.5GB）
+        run: |
+          ./scripts/download_models.sh
+          test -f "models/sherpa-onnx-fire-red-asr2-zh_en-int8-2026-02-26/encoder.int8.onnx"
+
+      - name: 构建并打包
+        run: |
+          flutter pub get
+          flutter build macos --release
+
+          APP=$(find build/macos/Build/Products/Release -maxdepth 1 -name '*.app' | head -1)
+          [ -n "$APP" ] || { echo "✗ 未找到 .app 产物"; exit 1; }
+          ./scripts/bundle_models.sh "$APP"
+
+          VER=$(sed -nE 's/^version:[[:space:]]*([0-9.]+).*/\1/p' pubspec.yaml | head -1)
+          VER=${VER:-dev}
+          if [ "${{ github.ref_type }}" = "tag" ] && [ "${{ github.ref_name }}" != "v$VER" ]; then
+            echo "✗ 标签 ${{ github.ref_name }} 与 pubspec.yaml 版本 v$VER 不一致，请修正后重新打标签"; exit 1
+          fi
+
+          # 未做签名/公证；ditto 打 zip 保留可执行位
+          ditto -c -k --keepParent "$APP" "build/voxdesk-macos-arm64-v$VER.zip"
+          echo "✓ 已生成 build/voxdesk-macos-arm64-v$VER.zip"
+          du -sh "build/voxdesk-macos-arm64-v$VER.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: voxdesk-macos-arm64
+          path: build/voxdesk-macos-*.zip
+          retention-days: 5
+          if-no-files-found: error
+          compression-level: 0
+
+  # ---------------- Windows x64 ----------------
+  build-windows:
+    name: Windows x64
+    runs-on: windows-2022
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: flutter-actions/setup-flutter@v4
+        with:
+          channel: stable
+          version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      - name: flutter 版本信息
+        run: |
+          flutter --version
+          flutter doctor
+        shell: bash
+
+      - name: 下载离线模型（约 1.5GB）
+        shell: pwsh
+        run: |
+          $ProgressPreference = 'SilentlyContinue' # 不关掉 IWR 会慢一个数量级
+          .\scripts\download_models.ps1
+          if (-not (Test-Path "models\sherpa-onnx-fire-red-asr2-zh_en-int8-2026-02-26\encoder.int8.onnx")) {
+            throw "模型下载不完整"
+          }
+
+      - name: 构建并打包
+        shell: bash
+        run: |
+          flutter pub get
+          flutter build windows --release
+
+          RELEASE=build/windows/x64/runner/Release
+          [ -d "$RELEASE" ] || { echo "✗ 未找到 Windows 构建产物"; exit 1; }
+          ./scripts/bundle_models.sh "$RELEASE"
+
+          VER=$(sed -nE 's/^version:[[:space:]]*([0-9.]+).*/\1/p' pubspec.yaml | head -1)
+          VER=${VER:-dev}
+          if [ "${{ github.ref_type }}" = "tag" ] && [ "${{ github.ref_name }}" != "v$VER" ]; then
+            echo "✗ 标签 ${{ github.ref_name }} 与 pubspec.yaml 版本 v$VER 不一致，请修正后重新打标签"; exit 1
+          fi
+
+          # bundle 目录改名，解压后得到 voxdesk/ 目录
+          mv "$RELEASE" build/windows/voxdesk
+          # 7z 预装在 windows runner 上；模型为不可压缩数据，-mx=1 换速度
+          7z a -tzip -mx=1 "build/voxdesk-windows-x64-v$VER.zip" ./build/windows/voxdesk
+          echo "✓ 已生成 build/voxdesk-windows-x64-v$VER.zip"
+          du -sh "build/voxdesk-windows-x64-v$VER.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: voxdesk-windows-x64
+          path: build/voxdesk-windows-*.zip
+          retention-days: 5
+          if-no-files-found: error
+          compression-level: 0
+
+  # ---------------- 发布（仅 v* 标签触发） ----------------
+  release:
+    name: 发布 GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-linux, build-macos, build-windows]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true # 三个平台的产物合并到 dist/ 平铺
+
+      - name: 生成 SHA256 校验和
+        run: |
+          cd dist
+          sha256sum * > ../SHA256SUMS.txt
+          mv ../SHA256SUMS.txt .
+          cat SHA256SUMS.txt
+
+      - name: 生成发布说明
+        run: |
+          cat > release-notes.md <<'EOF'
+          ## 下载说明
+
+          所有产物均**内置全部离线模型（约 1.5GB）**，解压即用，无需再下载模型。
+
+          | 平台 | 产物 | 说明 |
+          | --- | --- | --- |
+          | Windows x64 | `voxdesk-windows-x64-v*.zip` | 解压后运行 `voxdesk\voxdesk.exe`，无额外依赖 |
+          | Linux x64 | `voxdesk-linux-x64-v*.tar.gz` | **要求 glibc ≥ 2.28**，兼容统信 UOS 20 等旧系统 |
+          | macOS Apple Silicon | `voxdesk-macos-arm64-v*.zip` | 未签名，首次打开需放行（见下） |
+
+          ### Linux
+
+          ```bash
+          tar xzf voxdesk-linux-x64-v*.tar.gz
+          cd voxdesk
+          ./voxdesk
+          ```
+
+          - 基于 debian:buster 构建，最高仅依赖 GLIBC 2.28（UOS 20 / Debian 10 / CentOS 8 及以后均可运行）
+          - 运行时依赖 GTK3 / GStreamer / PulseAudio / ALSA：
+            `sudo apt install libgtk-3-0 gstreamer1.0-plugins-good gstreamer1.0-libav libpulse0 libasound2`
+          - 默认软件渲染（适配云桌面 / 无 GPU 环境）；有可用 GPU 时可
+            `FLUTTER_LINUX_RENDERER=opengl ./voxdesk` 切回硬件渲染
+
+          ### macOS（Apple Silicon）
+
+          未经签名公证，首次打开若提示「无法验证开发者」或「已损坏」：
+
+          ```bash
+          xattr -cr 离线语音工作台.app
+          ```
+
+          或在「系统设置 → 隐私与安全性」中点击「仍要打开」。
+
+          ### Windows x64
+
+          解压后直接运行 `voxdesk\voxdesk.exe`；若被 SmartScreen 拦截，点「更多信息 → 仍要运行」。
+          EOF
+
+      - name: 创建 Release 并上传产物
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: release-notes.md
+          files: dist/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true # 追加自动生成的变更记录
