@@ -47,5 +47,5 @@ GitHub 发布：推 `v*` 标签（须与 pubspec.yaml 的 `version` 一致，不
   - Windows/Linux：原生标题栏隐藏，窗口控制按钮由应用内 `widgets/title_bar.dart` 提供；macOS 走原生透明标题栏（见 `macos/Runner/MainFlutterWindow.swift`）——改标题栏行为需两端兼顾。
   - Linux：音频解码依赖 GStreamer、录音依赖 PulseAudio/ALSA（需 apt 安装）。
   - Linux 渲染兜底：`docker/linux-launcher.sh` 默认 `FLUTTER_LINUX_RENDERER=software`（引擎软件渲染，不依赖 EGL/OpenGL），Impeller 在 `linux/runner/my_application.cc` 中显式关闭；release 包里 `FLUTTER_ENGINE_SWITCHES` 环境变量机制被引擎裁剪（且它本身是"开关个数 + FLUTTER_ENGINE_SWITCH_N"格式），给引擎传开关只能改 runner 代码。
-- `models/` 目录含少量已跟踪的示例音频（models/audio/），模型本体较大，勿提交新的模型文件；`make build*` 会把 `./models`（排除 source/audio/test_wavs）内置进产物。
+- `models/` 目录整体被 `.gitignore` 忽略（`/models/`），不提交到远程仓库；模型本体较大，勿用 `-f` 强加。本地构建前用 `make models` 下载；GitHub 流水线（`.github/workflows/release.yml`）在构建时自动执行 `scripts/download_models.*` 现场下载并打包，不依赖仓库内的模型文件。`make build*` 会把 `./models`（排除 source/audio/test_wavs）内置进产物。
 - 提交信息惯例：`feat: <中文描述>`。
