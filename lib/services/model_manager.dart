@@ -39,6 +39,10 @@ class ModelPaths {
 
   bool get coreReady => asrReady && vadReady;
   bool get allCoreReady => coreReady && diarizationReady;
+
+  /// 是否至少匹配到一个模型文件（用于归位扫描时判断值得继续向上回溯）。
+  bool get matchedAny =>
+      asrReady || vadReady || diarizationReady || punctuationReady;
 }
 
 /// 模型目录扫描与默认位置管理。
@@ -186,6 +190,44 @@ class ModelManager {
       bundled: bundled,
     );
     return paths;
+  }
+
+  /// 归位扫描：从 [startPath]（目录或单个模型文件）出发找到模型根目录。
+  ///
+  /// 选择对话框在部分平台/系统版本下会返回文件路径，或用户选中了深层
+  /// 子目录中的模型文件：此时从文件所在目录开始；若关键模型不全，向上
+  /// 回溯最多 [maxUpLevels] 级，取第一个核心齐备的祖先目录；都找不到时
+  /// 返回最深一层（起始目录）的扫描结果，便于界面展示已匹配到的部分。
+  Future<ModelPaths?> resolveScan(String startPath, {int maxUpLevels = 4}) async {
+    var dir = Directory(startPath);
+    if (!dir.existsSync()) dir = dir.parent;
+
+    var best = await scan(dir.path);
+    if (best != null && best.coreReady) return best;
+
+    // 当前层毫无模型特征时不再向上回溯，避免误选无关文件后
+    // 把用户目录甚至整个磁盘递归扫一遍
+    var cur = dir;
+    for (var depth = 0; depth < maxUpLevels; depth++) {
+      if (best == null || !best.matchedAny) break;
+      final parent = cur.parent;
+      if (parent.path == cur.path || _isRootLikePath(parent.path)) break;
+      final up = await scan(parent.path);
+      if (up == null) break; // 祖先目录不存在/不可读，停止回溯
+      cur = parent;
+      if (up.coreReady) return up;
+      best = up;
+    }
+    return best;
+  }
+
+  /// 递归扫描这类路径代价过高（等于扫整个磁盘/所有挂载卷），回溯时跳过。
+  static bool _isRootLikePath(String path) {
+    if (path.isEmpty || path == '/' || path == '/Volumes') return true;
+    if (Platform.isWindows) {
+      return RegExp(r'^(?:[A-Za-z]:\\?|\\\\[^\\]+\\?)$').hasMatch(path);
+    }
+    return false;
   }
 
   /// 应用配置（记住上次选择的模型目录）。

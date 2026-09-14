@@ -77,6 +77,21 @@ models/
 `./models` 已就绪（`make models`），否则产物不含内置模型，运行时需手动
 选择模型目录。
 
+## 应用内选择模型目录
+
+左下角「加载模型」面板的「选择」按钮按平台分流：
+
+- **macOS**：「文件+目录」混合选择器，选中模型根目录或其中任意模型文件均可；
+- **Linux**：GTK 原生目录对话框（file_selector_linux）。不走 xdg-desktop-portal——
+  部分系统（UOS/Deepin 等旧 portal 后端）会忽略 FileChooser 的 directory 选项，
+  把目录请求退化成只能选文件的对话框；
+- **Windows**：file_picker 的目录选择器（IFileDialog + FOS_PICKFOLDERS）。
+
+无论选中目录还是文件，都会经 `ModelManager.resolveScan` 归位：从选中位置
+（文件则取其所在目录）向上最多回溯 4 级，找核心齐备的模型根目录再扫描；
+选中的文件没有任何模型特征时停在起始层，不向上扫大目录。归位成功后把
+模型根目录记入 `config.json`，与上面的查找顺序衔接。
+
 ## 手动下载地址
 
 - FireRedAsr2 AED:

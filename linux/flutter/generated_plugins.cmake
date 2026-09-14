@@ -6,6 +6,7 @@ list(APPEND FLUTTER_PLUGIN_LIST
   audio_decoder
   audioplayers_linux
   desktop_drop
+  file_selector_linux
   record_linux
   screen_retriever_linux
   window_manager

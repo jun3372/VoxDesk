@@ -1,5 +1,9 @@
+import 'dart:io';
+
 import 'package:file_picker/file_picker.dart';
+import 'package:file_selector/file_selector.dart' as file_selector;
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart' show MissingPluginException;
 
 import '../services/asr_engine.dart';
 import '../services/diarization_engine.dart';
@@ -64,21 +68,59 @@ class ModelController extends ChangeNotifier {
   }
 
   /// 让用户选择模型目录并扫描。
+  ///
+  /// 各平台的目录选择对话框实现参差：macOS 的纯目录对话框
+  /// （NSOpenPanel canChooseFiles=false）在部分系统版本下会退化成只能
+  /// 选中文件，改用「文件+目录」混合选择器；Linux 的 file_picker 走
+  /// xdg-desktop-portal，部分系统（UOS/Deepin 等旧 portal 后端）会忽略
+  /// directory 选项同样退化成只能选文件，改用 GTK 原生目录对话框
+  /// （file_selector_linux）。两者之外仍用 file_picker 的目录选择器；
+  /// 选中目录或其中任意模型文件都能归位到模型根目录。
   Future<void> chooseDirectory() async {
-    final dir = await FilePicker.getDirectoryPath(dialogTitle: '选择模型目录');
-    if (dir == null) return;
+    // 内置模型位于应用包内，不作为选择器的初始目录
+    final initial = (paths == null || paths!.bundled) ? null : paths!.dir;
+    String? picked;
+    if (Platform.isMacOS) {
+      final picks = await FilePicker.pickFileAndDirectoryPaths(
+        dialogTitle: '选择模型目录',
+        initialDirectory: initial,
+      );
+      if (picks.isEmpty) return;
+      // 混合选择器可多选：优先取选中的目录，全是文件时取第一个
+      picked = picks.any((p) => Directory(p).existsSync())
+          ? picks.firstWhere((p) => Directory(p).existsSync())
+          : picks.first;
+    } else if (Platform.isLinux) {
+      try {
+        picked = await file_selector.getDirectoryPath(
+          initialDirectory: initial,
+          confirmButtonText: '选择',
+        );
+      } on MissingPluginException {
+        picked = await FilePicker.getDirectoryPath(
+          dialogTitle: '选择模型目录',
+          initialDirectory: initial,
+        );
+      }
+    } else {
+      picked = await FilePicker.getDirectoryPath(
+        dialogTitle: '选择模型目录',
+        initialDirectory: initial,
+      );
+    }
+    if (picked == null) return;
 
     scanning = true;
     error = null;
     notifyListeners();
 
-    paths = await _manager.scan(dir);
+    paths = await _manager.resolveScan(picked);
     scanning = false;
 
     if (paths == null || !paths!.coreReady) {
       error = '该目录中未找到必需的模型文件（FireRedAsr2 / Silero VAD）';
     } else {
-      await ModelManager.saveDir(dir);
+      await ModelManager.saveDir(paths!.dir);
     }
     notifyListeners();
 

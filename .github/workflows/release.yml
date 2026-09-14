@@ -1,4 +1,8 @@
-# 三平台打包并发布 GitHub Release
+# 三平台打包并发布 GitHub Release（仅程序包，不含模型）
+#
+# 模型与程序已拆分：本流水线只打「应用 + 运行时」的程序包（约 100MB），
+# 离线模型（约 1.4GB）由 .github/workflows/models.yml 单独打包，发布在
+# models-v* 系列.Release；两个包配合使用的方式见发布说明。
 #
 # 流水线骨架参照 sherpa-onnx 官方 Flutter 打包配置
 # （.github/workflows/flutter-linux.yaml / flutter-macos.yaml / flutter-windows-x64.yaml，
@@ -7,22 +11,18 @@
 #   - 推送 v* 标签触发，workflow_dispatch 手动触发
 #   - concurrency 并发组避免重复构建
 #
-# 结合本仓库的两点差异做了适配：
-#   1. Linux 产物要求 glibc ≤ 2.28（兼容统信 UOS 20）：ubuntu-latest 的 glibc
-#      是 2.39，直接构建的产物在 UOS 上无法运行，因此整个 job 在 debian:buster
-#      容器（glibc 2.28）中执行，系统依赖清单与 docker/linux-builder.Dockerfile
-#      保持一致，并额外用 objdump 校验产物的最高 GLIBC 符号版本；
-#   2. 产物内置约 1.5GB 离线模型：先跑 scripts/download_models.sh（Windows 用
-#      .ps1），构建后由 scripts/bundle_models.sh 拷进 bundle，发布件为
-#      「应用 + 模型」一体包。
+# Linux 产物要求 glibc ≤ 2.28（兼容统信 UOS 20）：ubuntu-latest 的 glibc
+# 是 2.39，直接构建的产物在 UOS 上无法运行，因此整个 job 在 debian:buster
+# 容器（glibc 2.28）中执行，系统依赖清单与 docker/linux-builder.Dockerfile
+# 保持一致，并额外用 objdump 校验产物的最高 GLIBC 符号版本。
 #
 # 用法：
 #   发布：git tag v1.0.0 && git push origin v1.0.0（标签须与 pubspec.yaml 的
 #         version 字段一致，不一致会构建失败）
 #   试构建：Actions 页面手动 workflow_dispatch——只产出构建工件，不创建 Release。
 #
-# 注意：每个发布件约 1.4GB（模型为不可压缩数据），构建工件保留 5 天；
-#       GitHub Release 单文件上限 2GiB，当前体积在限额内。
+# 注意：发布件不含模型，运行时首次使用需按发布说明放置模型包（或启动后在
+#       应用内「加载模型」选择目录）；本地 make build 仍会把 ./models 内置。
 name: release
 
 on:
@@ -91,11 +91,6 @@ jobs:
           flutter --version
           flutter doctor
 
-      - name: 下载离线模型（约 1.5GB）
-        run: |
-          ./scripts/download_models.sh
-          test -f "models/sherpa-onnx-fire-red-asr2-zh_en-int8-2026-02-26/encoder.int8.onnx"
-
       - name: 构建并打包
         run: |
           flutter pub get
@@ -106,7 +101,6 @@ jobs:
 
           BUNDLE=$(find build/linux -type d -path '*release/bundle' | head -1)
           [ -n "$BUNDLE" ] || { echo "✗ 未找到 Linux 构建产物"; exit 1; }
-          ./scripts/bundle_models.sh "$BUNDLE"
 
           # 换成 UOS 兼容启动器（默认软件渲染，不依赖 EGL）
           mv "$BUNDLE/voxdesk" "$BUNDLE/voxdesk.bin"
@@ -143,8 +137,7 @@ jobs:
           name: voxdesk-linux-x64
           path: build/voxdesk-linux-*.tar.gz
           retention-days: 5
-          if-no-files-found: error
-          compression-level: 0 # tar.gz 已压缩，避免二次压缩浪费时间
+          if-no-files-found: error # tar.gz 已压缩，避免二次压缩浪费时间
 
   # ---------------- macOS（Apple Silicon） ----------------
   build-macos:
@@ -166,11 +159,6 @@ jobs:
           flutter --version
           flutter doctor
 
-      - name: 下载离线模型（约 1.5GB）
-        run: |
-          ./scripts/download_models.sh
-          test -f "models/sherpa-onnx-fire-red-asr2-zh_en-int8-2026-02-26/encoder.int8.onnx"
-
       - name: 构建并打包
         run: |
           flutter pub get
@@ -178,7 +166,6 @@ jobs:
 
           APP=$(find build/macos/Build/Products/Release -maxdepth 1 -name '*.app' | head -1)
           [ -n "$APP" ] || { echo "✗ 未找到 .app 产物"; exit 1; }
-          ./scripts/bundle_models.sh "$APP"
 
           VER=$(sed -nE 's/^version:[[:space:]]*([0-9.]+).*/\1/p' pubspec.yaml | head -1)
           VER=${VER:-dev}
@@ -197,7 +184,6 @@ jobs:
           path: build/voxdesk-macos-*.zip
           retention-days: 5
           if-no-files-found: error
-          compression-level: 0
 
   # ---------------- Windows x64 ----------------
   build-windows:
@@ -220,15 +206,6 @@ jobs:
           flutter doctor
         shell: bash
 
-      - name: 下载离线模型（约 1.5GB）
-        shell: pwsh
-        run: |
-          $ProgressPreference = 'SilentlyContinue' # 不关掉 IWR 会慢一个数量级
-          .\scripts\download_models.ps1
-          if (-not (Test-Path "models\sherpa-onnx-fire-red-asr2-zh_en-int8-2026-02-26\encoder.int8.onnx")) {
-            throw "模型下载不完整"
-          }
-
       - name: 构建并打包
         shell: bash
         run: |
@@ -237,7 +214,6 @@ jobs:
 
           RELEASE=build/windows/x64/runner/Release
           [ -d "$RELEASE" ] || { echo "✗ 未找到 Windows 构建产物"; exit 1; }
-          ./scripts/bundle_models.sh "$RELEASE"
 
           VER=$(sed -nE 's/^version:[[:space:]]*([0-9.]+).*/\1/p' pubspec.yaml | head -1)
           VER=${VER:-dev}
@@ -258,7 +234,6 @@ jobs:
           path: build/voxdesk-windows-*.zip
           retention-days: 5
           if-no-files-found: error
-          compression-level: 0
 
   # ---------------- 发布（仅 v* 标签触发） ----------------
   release:
@@ -284,15 +259,28 @@ jobs:
       - name: 生成发布说明
         run: |
           cat > release-notes.md <<'EOF'
-          ## 下载说明
+          ## 下载说明（程序包不含模型）
 
-          所有产物均**内置全部离线模型（约 1.5GB）**，解压即用，无需再下载模型。
+          程序包与模型包**分开下载**：本 Release 只含程序（约 100MB）；
+          离线模型（约 1.4GB）在 [`models-v*` Release](../../releases?q=models-v&expanded=false) 单独下载
+          （`voxdesk-models-v*.tar.gz`，由 models 流水线自动打包）。
 
-          | 平台 | 产物 | 说明 |
+          | 平台 | 程序包 | 说明 |
           | --- | --- | --- |
           | Windows x64 | `voxdesk-windows-x64-v*.zip` | 解压后运行 `voxdesk\voxdesk.exe`，无额外依赖 |
           | Linux x64 | `voxdesk-linux-x64-v*.tar.gz` | **要求 glibc ≥ 2.28**，兼容统信 UOS 20 等旧系统 |
           | macOS Apple Silicon | `voxdesk-macos-arm64-v*.zip` | 未签名，首次打开需放行（见下） |
+
+          ### 模型放置（三选一）
+
+          先解压模型包得到 `models/` 目录，然后任选其一：
+
+          1. **应用内选择（推荐）**：启动应用 → 左下角「加载模型」→ 选择该 `models/` 目录；
+          2. **默认目录**：把 `models/` 里的全部内容放进系统「文档」目录下的 `VoxDesk/models/`，
+             启动后自动加载；
+          3. **合并成开箱即用版**：
+             - Windows / Linux：把 `models/` 内容放进程序包的 `voxdesk/data/models/`；
+             - macOS：放进 `离线语音工作台.app/Contents/Resources/models/`。
 
           ### Linux
 

@@ -1,0 +1,120 @@
+# 离线模型独立打包与发布
+#
+# 与 release.yml（程序包流水线）配套：程序包自 v1.x 起不含模型，模型由本
+# 流水线单独打包成 voxdesk-models-v<版本>.tar.gz 并发布到 models-v* 系列
+# Release，供所有平台共用（ONNX 模型本身与平台无关）。
+#
+#   - 打包内容与 scripts/download_models.sh 下载结果一致，剔除引擎不加载
+#     的资源（source/、audio/、test_wavs/ 等，同 scripts/bundle_models.sh
+#     的排除清单），压缩后约 1.4GB；
+#   - 触发：推送 models-v* 标签（如 models-v1.0.0，须与 pubspec.yaml 的
+#     version 一致）→ 打包并创建 Release；workflow_dispatch 手动触发只产出
+#     构建工件，不创建 Release；
+#   - 模型版本跟随应用版本（同一 pubspec.yaml），升级应用版本时重新打一次
+#     models-v* 标签即可，模型本体仅在 sherpa-onnx 上游更新时才会变化。
+#
+# 用法见工作流内发布说明；模型放置方式（应用内选择 / 默认目录 / 并入程序
+# 包）与 docs/MODELS.md 保持一致。
+name: models
+
+on:
+  push:
+    tags:
+      - 'models-v*'
+  workflow_dispatch:
+
+concurrency:
+  group: models-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write # 发布 Release 需要写权限
+
+jobs:
+  package-models:
+    name: 打包离线模型
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 下载离线模型（约 1.5GB）
+        run: |
+          ./scripts/download_models.sh
+          test -f "models/sherpa-onnx-fire-red-asr2-zh_en-int8-2026-02-26/encoder.int8.onnx"
+
+      - name: 打包模型
+        run: |
+          VER=$(sed -nE 's/^version:[[:space:]]*([0-9.]+).*/\1/p' pubspec.yaml | head -1)
+          VER=${VER:-dev}
+          if [ "${{ github.ref_type }}" = "tag" ] && [ "${{ github.ref_name }}" != "models-v$VER" ]; then
+            echo "✗ 标签 ${{ github.ref_name }} 与 pubspec.yaml 版本 models-v$VER 不一致，请修正后重新打标签"; exit 1
+          fi
+
+          # 排除清单与 scripts/bundle_models.sh 一致：只留引擎会加载的模型本体
+          tar --exclude='source' --exclude='audio' --exclude='test_wavs' \
+            --exclude='._*' --exclude='.DS_Store' \
+            --exclude='*.tar.bz2' --exclude='*.part' \
+            -czf "voxdesk-models-v$VER.tar.gz" models
+          du -sh "voxdesk-models-v$VER.tar.gz"
+          tar -tzf "voxdesk-models-v$VER.tar.gz" | grep encoder.int8.onnx || {
+            echo "✗ 压缩包内缺少 FireRedAsr2 encoder"; exit 1; }
+
+          echo "MODEL_ARCHIVE=voxdesk-models-v$VER.tar.gz" >> "$GITHUB_ENV"
+          echo "MODEL_VER=$VER" >> "$GITHUB_ENV"
+
+      - name: 生成 SHA256 校验和
+        run: |
+          sha256sum "$MODEL_ARCHIVE" > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: 生成发布说明
+        run: |
+          cat > release-notes.md <<'EOF'
+          ## VoxDesk 离线模型包
+
+          配套 voxdesk 程序包使用：程序包自 v1.x 起**不含模型**，请从 `v*` 系列
+          Release 下载对应平台的程序包，并下载本模型包（约 1.4GB，解压后得到
+          `models/` 目录）。
+
+          模型清单：FireRedAsr2 AED int8（中英文语音识别，约 1.2GB）、Silero VAD
+          （语音活动检测）、Pyannote Segmentation + 3D-Speaker ERes2Net（说话人
+          分离）、CT-Transformer 中英文标点恢复（可选，约 290MB）。
+
+          ### 放置方式（三选一）
+
+          1. **应用内选择（推荐）**：启动 VoxDesk → 左下角「加载模型」→ 选择解压出的
+             `models/` 目录；
+          2. **默认目录**：把 `models/` 里的全部内容放进系统「文档」目录下的
+             `VoxDesk/models/`，启动后自动加载；
+          3. **合并成开箱即用版**：
+             - Windows / Linux：把 `models/` 内容放进程序包的 `voxdesk/data/models/`；
+             - macOS：放进 `离线语音工作台.app/Contents/Resources/models/`。
+
+          ### 解压方式
+
+          - macOS / Linux：`tar xzf voxdesk-models-v*.tar.gz`
+          - Windows 10+：系统自带 `tar` 命令，或用 7-Zip / WinRAR 解压
+
+          `SHA256SUMS.txt` 为压缩包校验和。
+          EOF
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: voxdesk-models
+          path: |
+            ${{ env.MODEL_ARCHIVE }}
+            SHA256SUMS.txt
+          retention-days: 5
+          if-no-files-found: error
+
+      - name: 发布到 models-v* Release
+        if: startsWith(github.ref, 'refs/tags/models-v')
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: release-notes.md
+          files: |
+            ${{ env.MODEL_ARCHIVE }}
+            SHA256SUMS.txt
+          fail_on_unmatched_files: true

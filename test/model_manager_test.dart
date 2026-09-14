@@ -126,4 +126,58 @@ void main() {
       expect(paths, isNull);
     });
   });
+
+  group('ModelManager.resolveScan', () {
+    late Directory tempDir;
+    late Directory asrDir;
+
+    setUp(() {
+      tempDir = Directory.systemTemp.createTempSync('voxdesk_resolve_test');
+      asrDir = Directory(
+        '${tempDir.path}/sherpa-onnx-fire-red-asr2-zh_en-int8-2026-02-26',
+      )..createSync(recursive: true);
+      File('${asrDir.path}/encoder.int8.onnx').writeAsStringSync('e');
+      File('${asrDir.path}/decoder.int8.onnx').writeAsStringSync('d');
+      File('${asrDir.path}/tokens.txt').writeAsStringSync('t');
+      File('${tempDir.path}/silero_vad.onnx').writeAsStringSync('v');
+    });
+
+    tearDown(() {
+      tempDir.deleteSync(recursive: true);
+    });
+
+    test('核心齐备的目录直接返回，不向上回溯', () async {
+      final paths = await ModelManager().resolveScan(tempDir.path);
+      expect(paths!.coreReady, isTrue);
+      expect(paths.dir, tempDir.path);
+    });
+
+    test('选中深层模型文件时归位到模型根目录', () async {
+      final encoderFile = File('${asrDir.path}/encoder.int8.onnx');
+      final paths = await ModelManager().resolveScan(encoderFile.path);
+      expect(paths!.coreReady, isTrue);
+      expect(paths.dir, tempDir.path);
+      expect(paths.sileroVad, '${tempDir.path}/silero_vad.onnx');
+    });
+
+    test('选中只含部分模型的嵌套子目录时向上找到模型根目录', () async {
+      final paths = await ModelManager().resolveScan(asrDir.path);
+      expect(paths!.coreReady, isTrue);
+      expect(paths.dir, tempDir.path);
+    });
+
+    test('选中无任何模型特征的文件时停在起始层，不向上扫大目录', () async {
+      final bare = Directory.systemTemp.createTempSync('voxdesk_bare_test');
+      try {
+        final sub = Directory('${bare.path}/a/b')..createSync(recursive: true);
+        File('${sub.path}/x.txt').writeAsStringSync('hi');
+        final paths = await ModelManager().resolveScan('${sub.path}/x.txt');
+        expect(paths, isNotNull);
+        expect(paths!.coreReady, isFalse);
+        expect(paths.dir, sub.path);
+      } finally {
+        bare.deleteSync(recursive: true);
+      }
+    });
+  });
 }
