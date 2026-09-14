@@ -34,8 +34,9 @@ flutter test             # 22 个单元/组件测试
 
 - **程序包**：推送 `v*` 标签（须与 pubspec.yaml 的 `version` 一致，如 `v1.0.0`）
   触发 [release.yml](.github/workflows/release.yml)，构建 **Windows x64 / macOS
-  (Apple Silicon) / Linux x64** 程序包（约 100MB，不含模型）并发布 Release；
-  Linux 产物在 debian:buster（glibc 2.28）容器中构建，兼容统信 UOS 20 等旧系统。
+  (Apple Silicon) / Linux x64 + arm64** 程序包（约 100MB，不含模型）并发布
+  Release；Linux 产物在 debian:buster（glibc 2.28）容器中构建，兼容统信 UOS 20
+  等旧系统。
 - **模型包**：推送 `models-v*` 标签或手动触发 [models.yml](.github/workflows/models.yml)，
   打包全部离线模型（约 1.4GB，所有平台共用）发布到 `models-v*` Release；
   首次使用按 Release 说明放置模型（应用内选择 / 文档目录 `VoxDesk/models` /

@@ -43,14 +43,26 @@ env:
   FLUTTER_VERSION: '3.47.4'
 
 jobs:
-  # ---------------- Linux x64（glibc 2.28：debian:buster 容器内构建） ----------------
+  # ---------------- Linux（glibc 2.28：debian:buster 容器内构建，x64 + arm64） ----------------
   build-linux:
-    name: Linux x64 (glibc 2.28)
-    runs-on: ubuntu-latest
+    name: Linux ${{ matrix.arch }} (glibc 2.28)
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: ubuntu-latest
+          # Flutter 不支持交叉编译，arm64 产物必须在 arm64 宿主上构建；
+          # ubuntu-24.04-arm 为 GitHub 公共仓库免费 runner（私有仓库需付费
+          # larger runner，或自建 arm64 机器注册同名 label，Gitea 同理）
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     container:
       # glibc 2.28，与 UOS 20 对齐；更高版本容器（如 ubuntu:24.04 / glibc 2.39）
-      # 构建的产物无法在 UOS 20 上运行
+      # 构建的产物无法在 UOS 20 上运行。官方镜像为多架构 manifest，按 runner
+      # 架构自动拉取 amd64 / arm64 变体
       image: debian:buster
 
     steps:
@@ -80,7 +92,18 @@ jobs:
 
       - uses: actions/checkout@v4
 
+      # Flutter 官方不发布 linux-arm64 的 SDK tarball（release 只有 x64），
+      # arm64 宿主改用 git 克隆安装：flutter 工具首次运行时自动下载与
+      # 宿主架构匹配的 Dart SDK / 引擎产物（本地 .flutter 克隆即同一路径）
+      - name: 安装 Flutter SDK（git 克隆，arm64 宿主无官方 tarball）
+        if: matrix.arch == 'arm64'
+        run: |
+          git clone --depth 1 --branch "$FLUTTER_VERSION" \
+            https://github.com/flutter/flutter.git "$HOME/flutter"
+          echo "$HOME/flutter/bin" >> "$GITHUB_PATH"
+
       - uses: flutter-actions/setup-flutter@v4
+        if: matrix.arch == 'x64'
         with:
           channel: stable
           version: ${{ env.FLUTTER_VERSION }}
@@ -128,16 +151,16 @@ jobs:
           # 容器内新构建的文件不带 macOS 扩展属性，无需 --no-xattrs
           mv "$BUNDLE" "$(dirname "$BUNDLE")/voxdesk"
           tar --exclude='._*' --exclude='.DS_Store' \
-            -czf "build/voxdesk-linux-x64-v$VER.tar.gz" -C "$(dirname "$BUNDLE")" voxdesk
-          echo "✓ 已生成 build/voxdesk-linux-x64-v$VER.tar.gz"
-          du -sh "build/voxdesk-linux-x64-v$VER.tar.gz"
+            -czf "build/voxdesk-linux-${{ matrix.arch }}-v$VER.tar.gz" -C "$(dirname "$BUNDLE")" voxdesk
+          echo "✓ 已生成 build/voxdesk-linux-${{ matrix.arch }}-v$VER.tar.gz"
+          du -sh "build/voxdesk-linux-${{ matrix.arch }}-v$VER.tar.gz"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: voxdesk-linux-x64
+          name: voxdesk-linux-${{ matrix.arch }}
           path: build/voxdesk-linux-*.tar.gz
           retention-days: 5
-          if-no-files-found: error # tar.gz 已压缩，避免二次压缩浪费时间
+          if-no-files-found: error
 
   # ---------------- macOS（Apple Silicon） ----------------
   build-macos:
@@ -269,6 +292,7 @@ jobs:
           | --- | --- | --- |
           | Windows x64 | `voxdesk-windows-x64-v*.zip` | 解压后运行 `voxdesk\voxdesk.exe`，无额外依赖 |
           | Linux x64 | `voxdesk-linux-x64-v*.tar.gz` | **要求 glibc ≥ 2.28**，兼容统信 UOS 20 等旧系统 |
+          | Linux arm64 | `voxdesk-linux-arm64-v*.tar.gz` | 飞腾 / 鲲鹏等 arm64 主机（含 UOS arm64 版），同样要求 glibc ≥ 2.28 |
           | macOS Apple Silicon | `voxdesk-macos-arm64-v*.zip` | 未签名，首次打开需放行（见下） |
 
           ### 模型放置（三选一）
