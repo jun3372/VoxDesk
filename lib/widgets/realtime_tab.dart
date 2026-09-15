@@ -6,6 +6,7 @@ import '../core/theme.dart';
 import '../data/transcript_models.dart';
 import '../services/history_service.dart';
 import '../state/history_controller.dart';
+import '../state/model_controller.dart';
 import '../state/realtime_controller.dart';
 import 'common.dart';
 import 'player_bar.dart';
@@ -22,6 +23,9 @@ class RealtimeTab extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final ctrl = context.watch<RealtimeController>();
+    // canStart/canRetranscribe 依赖 models.ready：模型后台加载完成时
+    // 本页不会收到 RealtimeController 的通知，需一并订阅刷新按钮态
+    context.watch<ModelController>();
 
     return Padding(
       padding: const EdgeInsets.fromLTRB(28, 12, 28, 20),
@@ -293,6 +297,33 @@ class _EndedBody extends StatelessWidget {
               ),
             ),
             const Spacer(),
+            // 重新转写也走 useDiarization 开关（开始时快照），此处可随时勾选
+            SizedBox(
+              width: 20,
+              child: Checkbox(
+                value: ctrl.useDiarization,
+                activeColor: AppColors.primary,
+                onChanged: (v) => ctrl.setUseDiarization(v ?? false),
+              ),
+            ),
+            const Text(
+              '自动标注说话人',
+              style: TextStyle(fontSize: 13, color: AppColors.textPrimary),
+            ),
+            Tooltip(
+              message: ctrl.models.diarizationAvailable
+                  ? '重新转写时使用本地说话人分离模型自动区分不同说话人并标注标签'
+                  : '未检测到说话人分离模型，可在模型目录中放入说话人分离模型后启用',
+              child: const Padding(
+                padding: EdgeInsets.only(left: 4),
+                child: Icon(
+                  Icons.info_outline,
+                  size: 15,
+                  color: AppColors.textSecondary,
+                ),
+              ),
+            ),
+            const SizedBox(width: 12),
             GhostButton(
               label: '重新开始',
               icon: Icons.refresh_rounded,

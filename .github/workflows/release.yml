@@ -4,6 +4,13 @@
 # 离线模型（约 1.4GB）由 .github/workflows/models.yml 单独打包，发布在
 # models-v* 系列.Release；两个包配合使用的方式见发布说明。
 #
+# 除免安装压缩包外，每个平台由同一份构建产物再产出安装包：
+#   Windows x64 — Inno Setup（windows-2022 runner 预装 ISCC）：
+#                 voxdesk-windows-x64-v*-setup.exe（脚本 packaging/windows-installer.iss）
+#   Linux       — .deb（debian:buster 容器内 dpkg-deb，UOS 20 / Debian 系原生格式，
+#                 脚本 scripts/build_deb.sh）
+#   macOS       — .dmg（hdiutil 生成，拖入「应用程序」即完成安装）
+#
 # 流水线骨架参照 sherpa-onnx 官方 Flutter 打包配置
 # （.github/workflows/flutter-linux.yaml / flutter-macos.yaml / flutter-windows-x64.yaml，
 #   https://github.com/k2-fsa/sherpa-onnx）：
@@ -155,10 +162,13 @@ jobs:
           echo "✓ 已生成 build/voxdesk-linux-${{ matrix.arch }}-v$VER.tar.gz"
           du -sh "build/voxdesk-linux-${{ matrix.arch }}-v$VER.tar.gz"
 
+          # 同一 bundle 再打 .deb 安装包（UOS 20 / Debian 系原生安装格式）
+          bash scripts/build_deb.sh "$(dirname "$BUNDLE")/voxdesk" build
+
       - uses: actions/upload-artifact@v4
         with:
           name: voxdesk-linux-${{ matrix.arch }}
-          path: build/voxdesk-linux-*.tar.gz
+          path: build/voxdesk-linux-*
           retention-days: 5
           if-no-files-found: error
 
@@ -201,10 +211,20 @@ jobs:
           echo "✓ 已生成 build/voxdesk-macos-arm64-v$VER.zip"
           du -sh "build/voxdesk-macos-arm64-v$VER.zip"
 
+          # DMG 安装镜像：拖入「应用程序」即完成安装（与 zip 同一产物，同样未签名）
+          DMG_STAGE=$(mktemp -d)
+          cp -R "$APP" "$DMG_STAGE/"
+          ln -s /Applications "$DMG_STAGE/Applications"
+          hdiutil create -volname "离线语音工作台" -srcfolder "$DMG_STAGE" \
+            -format UDZO -ov "build/voxdesk-macos-arm64-v$VER.dmg" > /dev/null
+          rm -rf "$DMG_STAGE"
+          echo "✓ 已生成 build/voxdesk-macos-arm64-v$VER.dmg"
+          du -sh "build/voxdesk-macos-arm64-v$VER.dmg"
+
       - uses: actions/upload-artifact@v4
         with:
           name: voxdesk-macos-arm64
-          path: build/voxdesk-macos-*.zip
+          path: build/voxdesk-macos-*
           retention-days: 5
           if-no-files-found: error
 
@@ -251,10 +271,23 @@ jobs:
           echo "✓ 已生成 build/voxdesk-windows-x64-v$VER.zip"
           du -sh "build/voxdesk-windows-x64-v$VER.zip"
 
+          # 版本号带给后续 Inno Setup 步骤
+          echo "VER=$VER" >> "$GITHUB_ENV"
+
+      - name: 生成 Inno Setup 安装包
+        shell: pwsh
+        run: |
+          # windows-2022 runner 预装 Inno Setup 6（自带简体中文向导语言文件）
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { Write-Error "未找到 ISCC.exe: $iscc"; exit 1 }
+          & $iscc "/DAppVersion=$env:VER" "/DAppSource=$PWD\build\windows\voxdesk" packaging\windows-installer.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-Item "build\voxdesk-windows-x64-v${env:VER}-setup.exe" | ForEach-Object { "✓ 已生成 $($_.Name) ($([math]::Round($_.Length/1MB, 1)) MB)" }
+
       - uses: actions/upload-artifact@v4
         with:
           name: voxdesk-windows-x64
-          path: build/voxdesk-windows-*.zip
+          path: build/voxdesk-windows-*
           retention-days: 5
           if-no-files-found: error
 
@@ -288,12 +321,14 @@ jobs:
           离线模型（约 1.4GB）在 [`models-v*` Release](../../releases?q=models-v&expanded=false) 单独下载
           （`voxdesk-models-v*.tar.gz`，由 models 流水线自动打包）。
 
-          | 平台 | 程序包 | 说明 |
-          | --- | --- | --- |
-          | Windows x64 | `voxdesk-windows-x64-v*.zip` | 解压后运行 `voxdesk\voxdesk.exe`，无额外依赖 |
-          | Linux x64 | `voxdesk-linux-x64-v*.tar.gz` | **要求 glibc ≥ 2.28**，兼容统信 UOS 20 等旧系统 |
-          | Linux arm64 | `voxdesk-linux-arm64-v*.tar.gz` | 飞腾 / 鲲鹏等 arm64 主机（含 UOS arm64 版），同样要求 glibc ≥ 2.28 |
-          | macOS Apple Silicon | `voxdesk-macos-arm64-v*.zip` | 未签名，首次打开需放行（见下） |
+          每个平台同时提供**安装包**与**免安装压缩包**两种形态，内容一致，任选其一。
+
+          | 平台 | 安装包 | 免安装压缩包 | 说明 |
+          | --- | --- | --- | --- |
+          | Windows x64 | `voxdesk-windows-x64-v*-setup.exe` | `voxdesk-windows-x64-v*.zip` | 安装包：中文向导、装到 `%LocalAppData%\Programs\VoxDesk`、带开始菜单 / 可选桌面快捷方式 |
+          | Linux x64 | `voxdesk-linux-x64-v*.deb` | `voxdesk-linux-x64-v*.tar.gz` | **要求 glibc ≥ 2.28**，兼容统信 UOS 20 等旧系统 |
+          | Linux arm64 | `voxdesk-linux-arm64-v*.deb` | `voxdesk-linux-arm64-v*.tar.gz` | 飞腾 / 鲲鹏等 arm64 主机（含 UOS arm64 版），同样要求 glibc ≥ 2.28 |
+          | macOS Apple Silicon | `voxdesk-macos-arm64-v*.dmg` | `voxdesk-macos-arm64-v*.zip` | 未签名，首次打开需放行（见下） |
 
           ### 模型放置（三选一）
 
@@ -302,11 +337,20 @@ jobs:
           1. **应用内选择（推荐）**：启动应用 → 左下角「加载模型」→ 选择该 `models/` 目录；
           2. **默认目录**：把 `models/` 里的全部内容放进系统「文档」目录下的 `VoxDesk/models/`，
              启动后自动加载；
-          3. **合并成开箱即用版**：
-             - Windows / Linux：把 `models/` 内容放进程序包的 `voxdesk/data/models/`；
-             - macOS：放进 `离线语音工作台.app/Contents/Resources/models/`。
+          3. **合并成开箱即用版**：把 `models/` 内容放进程序目录的模型位置——
+             - Windows：程序目录下 `data\models\`（安装包默认在 `%LocalAppData%\Programs\VoxDesk\data\models\`）；
+             - Linux：`/opt/VoxDesk/data/models/`；
+             - macOS：`离线语音工作台.app/Contents/Resources/models/`。
 
           ### Linux
+
+          安装包方式（会自动装上依赖的运行库）：
+
+          ```bash
+          sudo apt install ./voxdesk-linux-x64-v*.deb   # 或 sudo dpkg -i 后按提示补依赖
+          ```
+
+          免安装方式：
 
           ```bash
           tar xzf voxdesk-linux-x64-v*.tar.gz
@@ -318,21 +362,23 @@ jobs:
           - 运行时依赖 GTK3 / GStreamer / PulseAudio / ALSA：
             `sudo apt install libgtk-3-0 gstreamer1.0-plugins-good gstreamer1.0-libav libpulse0 libasound2`
           - 默认软件渲染（适配云桌面 / 无 GPU 环境）；有可用 GPU 时可
-            `FLUTTER_LINUX_RENDERER=opengl ./voxdesk` 切回硬件渲染
+            `FLUTTER_LINUX_RENDERER=opengl voxdesk` 切回硬件渲染
 
           ### macOS（Apple Silicon）
 
-          未经签名公证，首次打开若提示「无法验证开发者」或「已损坏」：
+          打开 dmg 把应用拖入「应用程序」（或解压 zip）。未经签名公证，首次打开若提示
+          「无法验证开发者」或「已损坏」：
 
           ```bash
-          xattr -cr 离线语音工作台.app
+          xattr -cr /Applications/离线语音工作台.app
           ```
 
           或在「系统设置 → 隐私与安全性」中点击「仍要打开」。
 
           ### Windows x64
 
-          解压后直接运行 `voxdesk\voxdesk.exe`；若被 SmartScreen 拦截，点「更多信息 → 仍要运行」。
+          运行 `-setup.exe` 按向导安装，或解压 zip 后直接运行 `voxdesk\voxdesk.exe`。
+          安装包与 exe 均未签名，若被 SmartScreen 拦截，点「更多信息 → 仍要运行」。
           EOF
 
       - name: 创建 Release 并上传产物

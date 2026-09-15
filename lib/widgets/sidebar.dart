@@ -280,7 +280,37 @@ class _ModelPanel extends StatefulWidget {
 }
 
 class _ModelPanelState extends State<_ModelPanel> {
-  bool _expanded = false;
+  /// 面板是否折叠为标题行；默认展开，模型加载成功后自动折叠。
+  bool _collapsed = false;
+  ModelController? _models;
+  bool _wasReady = false;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final models = context.read<ModelController>();
+    if (!identical(models, _models)) {
+      _models?.removeListener(_onModelsChanged);
+      _models = models..addListener(_onModelsChanged);
+      _wasReady = models.asrReady;
+    }
+  }
+
+  /// 引擎就绪（asrReady false→true 跳变）时自动折叠面板；
+  /// 已就绪后的其他通知（如分离模型加载）不反复折叠。
+  void _onModelsChanged() {
+    final ready = _models!.asrReady;
+    if (ready && !_wasReady && mounted) {
+      setState(() => _collapsed = true);
+    }
+    _wasReady = ready;
+  }
+
+  @override
+  void dispose() {
+    _models?.removeListener(_onModelsChanged);
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -311,7 +341,7 @@ class _ModelPanelState extends State<_ModelPanel> {
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               InkWell(
-                onTap: () => setState(() => _expanded = !_expanded),
+                onTap: () => setState(() => _collapsed = !_collapsed),
                 child: Row(
                   children: [
                     const Icon(
@@ -332,7 +362,7 @@ class _ModelPanelState extends State<_ModelPanel> {
                     pill,
                     const Spacer(),
                     AnimatedRotation(
-                      turns: _expanded ? 0.5 : 0,
+                      turns: _collapsed ? 0 : 0.5,
                       duration: const Duration(milliseconds: 200),
                       child: const Icon(
                         Icons.keyboard_arrow_down_rounded,
@@ -344,15 +374,15 @@ class _ModelPanelState extends State<_ModelPanel> {
                 ),
               ),
               AnimatedCrossFade(
-                crossFadeState: _expanded
-                    ? CrossFadeState.showFirst
-                    : CrossFadeState.showSecond,
+                crossFadeState: _collapsed
+                    ? CrossFadeState.showSecond
+                    : CrossFadeState.showFirst,
                 duration: const Duration(milliseconds: 200),
-                firstChild: const SizedBox(width: double.infinity),
-                secondChild: Padding(
+                firstChild: Padding(
                   padding: const EdgeInsets.only(top: 12),
                   child: _ExpandedBody(models: models),
                 ),
+                secondChild: const SizedBox(width: double.infinity),
               ),
             ],
           ),

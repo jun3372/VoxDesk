@@ -1,8 +1,10 @@
 import 'dart:io';
+import 'dart:math';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
+import 'package:screen_retriever/screen_retriever.dart';
 import 'package:sherpa_onnx/sherpa_onnx.dart' as sherpa;
 import 'package:window_manager/window_manager.dart';
 
@@ -12,6 +14,25 @@ import 'state/history_controller.dart';
 import 'state/model_controller.dart';
 import 'state/realtime_controller.dart';
 import 'state/upload_controller.dart';
+
+/// 默认窗口大小；小屏幕上若超过屏幕可视区域，启动时收缩为屏幕可视大小。
+const _defaultWindowSize = Size(1280, 800);
+
+Future<Size> _resolveWindowSize() async {
+  try {
+    final display = await screenRetriever.getPrimaryDisplay();
+    final visible = display.visibleSize ?? display.size;
+    if (visible.width > 0 && visible.height > 0) {
+      return Size(
+        min(_defaultWindowSize.width, visible.width),
+        min(_defaultWindowSize.height, visible.height),
+      );
+    }
+  } catch (e) {
+    debugPrint('获取屏幕信息失败，使用默认窗口大小: $e');
+  }
+  return _defaultWindowSize;
+}
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -24,8 +45,9 @@ Future<void> main() async {
   // 提供（macOS 走原生透明标题栏 + 交通灯，见 MainFlutterWindow.swift）
   if (!kIsWeb && (Platform.isWindows || Platform.isLinux)) {
     await windowManager.ensureInitialized();
-    const options = WindowOptions(
-      size: Size(1280, 800),
+    final windowSize = await _resolveWindowSize();
+    final options = WindowOptions(
+      size: windowSize,
       minimumSize: Size(980, 640),
       center: true,
       title: '离线语音工作台',
