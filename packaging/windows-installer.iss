@@ -34,8 +34,10 @@ PrivilegesRequiredOverridesAllowed=dialog
 ArchitecturesInstallIn64BitMode=x64compatible
 
 [Languages]
-; 简体中文向导（Inno Setup 6.3+ 官方自带该语言文件）
-Name: "chinesesimplified"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
+; 简体中文向导。runner 预装的 Inno Setup 经 Chocolatey 静默安装、不含语言包，
+; 故语言文件随仓库内置（packaging\ChineseSimplified.isl，取自 Inno Setup 官方
+; 源码 issrc 的 is-6_7_1 标签，带 BOM 的 UTF-8），以相对 iss 目录的路径引用
+Name: "chinesesimplified"; MessagesFile: "ChineseSimplified.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"

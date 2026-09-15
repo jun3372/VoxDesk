@@ -277,7 +277,8 @@ jobs:
       - name: 生成 Inno Setup 安装包
         shell: pwsh
         run: |
-          # windows-2022 runner 预装 Inno Setup 6（自带简体中文向导语言文件）
+          # windows-2022 runner 预装 Inno Setup 6（Chocolatey 静默安装、不含语言包，
+          # 简体中文向导语言文件由仓库 packaging/ChineseSimplified.isl 提供）
           $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
           if (-not (Test-Path $iscc)) { Write-Error "未找到 ISCC.exe: $iscc"; exit 1 }
           & $iscc "/DAppVersion=$env:VER" "/DAppSource=$PWD\build\windows\voxdesk" packaging\windows-installer.iss
