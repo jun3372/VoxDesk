@@ -52,8 +52,8 @@ class AsrEngine {
 
   /// 识别一段 16kHz 单声道语音，返回文本。
   ///
-  /// [punctuate] 为 true 且加载了标点模型时，会先延迟加载标点模型再做
-  /// 标点恢复（首次调用会额外耗时数秒）。
+  /// [punctuate] 为 true 且加载了标点模型时，识别后做标点恢复
+  /// （标点模型已随引擎加载一并就绪）。
   Future<String> recognize(Float32List samples, {bool punctuate = false}) {
     if (!_ready) throw StateError('ASR 引擎尚未加载');
     final id = _nextId++;
@@ -144,6 +144,10 @@ Future<void> _workerMain(SendPort initial) async {
           );
           recognizer = sherpa.OfflineRecognizer(config);
           punctModelPath = m['punctModel'] as String;
+          // 标点模型随引擎一并就绪，避免首句识别时额外停顿数秒
+          if (punctModelPath.isNotEmpty) {
+            punct = _loadPunct(punctModelPath);
+          }
           initial.send({'type': 'ready'});
         } catch (e) {
           initial.send({'type': 'error', 'message': e.toString()});
@@ -198,5 +202,71 @@ sherpa.OfflinePunctuation? _loadPunct(String path) {
     );
   } catch (_) {
     return null;
+  }
+}
+
+/// ASR 引擎池：多个 worker Isolate 并发解码，对外暴露与 [AsrEngine]
+/// 相同的 `recognize` 接口，请求自动分发到最空闲的 worker。
+///
+/// 每个 worker 独立加载一份模型（encoder int8 约 780MB），worker 数由
+/// 设备算力决定（见 device_tuning.dart），调用方无需关心。
+class AsrEnginePool {
+  final List<AsrEngine> _workers = [];
+  final List<int> _inFlight = [];
+
+  bool _ready = false;
+  bool get ready => _ready;
+
+  /// worker 数量（未加载时为 0）。
+  int get workerCount => _workers.length;
+
+  /// 并行加载 [workers] 个 worker（并行加载缩短启动时间）。
+  Future<void> load({
+    required ModelPaths paths,
+    int workers = 1,
+    int numThreads = 2,
+  }) async {
+    await quit();
+    final count = workers < 1 ? 1 : workers;
+    final engines = List.generate(count, (_) => AsrEngine());
+    try {
+      await Future.wait(
+        engines.map((e) => e.load(paths: paths, numThreads: numThreads)),
+      );
+    } catch (_) {
+      await Future.wait(engines.map((e) => e.quit()));
+      rethrow;
+    }
+    _workers
+      ..clear()
+      ..addAll(engines);
+    _inFlight
+      ..clear()
+      ..addAll(List.filled(count, 0));
+    _ready = true;
+  }
+
+  /// 识别一段 16kHz 单声道语音，分发到当前在途请求最少的 worker。
+  Future<String> recognize(Float32List samples, {bool punctuate = false}) {
+    if (!_ready) throw StateError('ASR 引擎尚未加载');
+    var best = 0;
+    for (var i = 1; i < _workers.length; i++) {
+      if (_inFlight[i] < _inFlight[best]) best = i;
+    }
+    final index = best;
+    _inFlight[index]++;
+    return _workers[index]
+        .recognize(samples, punctuate: punctuate)
+        // quit 后挂起请求以空串完成，此时 _inFlight 可能已清空
+        .whenComplete(() {
+          if (index < _inFlight.length) _inFlight[index]--;
+        });
+  }
+
+  Future<void> quit() async {
+    await Future.wait(_workers.map((e) => e.quit()));
+    _workers.clear();
+    _inFlight.clear();
+    _ready = false;
   }
 }

@@ -8,8 +8,10 @@ import '../services/audio_decode_service.dart';
 import '../services/diarization_engine.dart';
 import '../services/history_service.dart';
 import '../services/recorder_service.dart';
+import '../services/transcribe_pipeline.dart';
 import '../services/vad_engine.dart';
 import '../services/wav_io.dart';
+import '../services/wav_stream_writer.dart';
 import 'model_controller.dart';
 
 /// 实时转写状态机：就绪 → 录音中 → 已结束。
@@ -98,8 +100,13 @@ class RealtimeController extends ChangeNotifier {
   final ValueNotifier<double?> seekRequest = ValueNotifier<double?>(null);
 
   Timer? _ticker;
-  final List<Float32List> _chunks = [];
   int _totalSamples = 0;
+
+  /// 录音分片边录边落盘：草稿目录在会话开始时创建，session.wav
+  /// 由 [_writer] 流式追加，常驻内存不随会话时长增长。
+  RealtimeSessionDraft? _draft;
+  WavStreamWriter? _writer;
+
   Future<void> _queue = Future.value();
   bool _stopping = false;
 
@@ -107,6 +114,11 @@ class RealtimeController extends ChangeNotifier {
   // 分离引擎一次只能跑一个任务且整轮计算较重，用间隔节流 +
   // 「上一轮未结束则跳过」的自然背控制 CPU 占用。
   static const int _incrDiarIntervalSec = 45;
+
+  /// 增量分离只在前 30 分钟内进行：每轮需把已录制前缀整段读入内存，
+  /// 不设上限会随录音时长线性增长；超过阈值后新段落暂不预标注，
+  /// 结束时全量分离仍会补齐全部说话人标签（最终结果不变）。
+  static const int _incrDiarMaxDurationSec = 30 * 60;
   int _sessionGen = 0;
   bool _incrDiarBusy = false;
   double _incrDiarMarkSec = 0;
@@ -140,22 +152,37 @@ class RealtimeController extends ChangeNotifier {
     _incrDiarMarkSec = 0;
     liveDiarizing = false;
     _sessionDiarize = useDiarization;
+    final started = DateTime.now();
     try {
       _vad.load(models.paths!.sileroVad);
       _feeder = VadWindowFeeder(_onWindow);
+      // 先建草稿目录并打开录音文件，采集分片随即边录边写盘
+      final draft = _draft = await history.beginRealtimeDraft(
+        createdAt: started,
+        device: deviceName,
+      );
+      _writer = await WavStreamWriter.open(draft.audioPath!);
       await _recorder.start(_onSamples);
     } catch (e) {
+      await _writer?.abort();
+      _writer = null;
+      final draftPath = _draft?.audioPath;
+      if (draftPath != null) {
+        try {
+          await File(draftPath).parent.delete(recursive: true);
+        } catch (_) {}
+      }
+      _draft = null;
       error = '$e';
       notifyListeners();
       return;
     }
 
-    startedAt = DateTime.now();
+    startedAt = started;
     elapsedSec = 0;
     paused = false;
     _stopping = false;
     segments = [];
-    _chunks.clear();
     _totalSamples = 0;
     phase = RealtimePhase.recording;
     _ticker?.cancel();
@@ -201,46 +228,78 @@ class RealtimeController extends ChangeNotifier {
       _vad.free();
 
       endedDurationSec = _totalSamples / VadEngine.sampleRate;
-      final fullAudio = _mergeChunks();
-      peaks = AudioDecodeService.waveformFromSamples(fullAudio);
 
-      // 两段式保存：先落盘录音文件（供结束页立即回放），随即立即写入
-      // 历史记录；说话人标注后台补齐后原地更新，历史列表先见为快。
-      final draft = await history.createRealtimeSessionDraft(
-        createdAt: startedAt ?? DateTime.now(),
-        durationSec: endedDurationSec,
-        device: deviceName,
-        audio: fullAudio,
-      );
-      viewedHistoryId = draft.id;
-      audioPath = draft.audioPath;
+      // 收尾录音文件：冲刷缓冲并回填 WAV 头尺寸，文件即刻完整可读。
+      // 录音全程已边录边落盘，此处无大内存合并。
+      String? savedAudioPath;
+      final writer = _writer;
+      _writer = null;
+      if (writer != null) {
+        try {
+          await writer.finalize();
+          savedAudioPath = _draft?.audioPath;
+        } catch (e) {
+          debugPrint('录音文件写入失败: $e');
+          await writer.abort();
+          savedAudioPath = null; // 录音保存失败不影响文字记录
+        }
+      }
+      audioPath = savedAudioPath;
       if (audioPath != null) {
         try {
           audioSizeBytes = File(audioPath!).lengthSync();
         } catch (_) {}
       }
-      try {
-        await history.finalizeRealtimeSession(draft, segments);
-        onHistorySaved?.call(draft.id);
-      } catch (e) {
-        error = '保存历史记录失败：$e';
+
+      final draft = _draft;
+      _draft = null;
+      if (draft != null) {
+        viewedHistoryId = draft.id;
+        try {
+          await history.finalizeRealtimeSession(
+            draft,
+            segments,
+            durationSec: endedDurationSec,
+          );
+          onHistorySaved?.call(draft.id);
+        } catch (e) {
+          error = '保存历史记录失败：$e';
+        }
       }
       phase = RealtimePhase.ended;
       saving = false;
       notifyListeners();
+
+      // 波形由原生解码器流式计算（与历史回看路径一致），后台补算
+      // 不阻塞历史转正；等待期间用户切走则不覆盖新内容
+      if (savedAudioPath != null && draft != null) {
+        final wave = await AudioDecodeService.computeWaveform(savedAudioPath);
+        if (viewedHistoryId == draft.id && phase == RealtimePhase.ended) {
+          peaks = wave;
+          notifyListeners();
+        }
+      }
 
       // —— 后台说话人分离 ——
       final baseSegments = List<TranscriptSegment>.of(segments);
       var finalSegments = baseSegments;
       if (_sessionDiarize &&
           models.diarizationAvailable &&
-          fullAudio.length > 16000 * 3) {
+          _totalSamples > 16000 * 3 &&
+          savedAudioPath != null &&
+          draft != null) {
         diarizing = true;
         notifyListeners();
         try {
           final ok = await models.ensureDiarization();
           if (ok) {
-            final diarSegs = await models.diarization.process(fullAudio);
+            // 流式读回已落盘录音并零拷贝移交分离 isolate（瞬时一份，
+            // 用完即释放）
+            final wav = await readWavStreamed(savedAudioPath);
+            final diarSegs = await models.diarization.process(
+              wav.samples,
+              transfer: true,
+            );
             finalSegments = assignSpeakers(
               segments: baseSegments,
               diarSegments: [
@@ -266,6 +325,12 @@ class RealtimeController extends ChangeNotifier {
       }
     } catch (e) {
       error = '保存会话失败：$e';
+      // 异常中断时尽力收尾录音文件，避免句柄泄漏；残留草稿目录
+      // 由下次启动时的 cleanDrafts 清理
+      final writer = _writer;
+      _writer = null;
+      await writer?.abort();
+      _draft = null;
       phase = RealtimePhase.ended;
       saving = false;
       diarizing = false;
@@ -364,7 +429,8 @@ class RealtimeController extends ChangeNotifier {
 
     Float32List samples;
     try {
-      final wav = parseWav(await File(path).readAsBytes());
+      // 流式读取，避免整读字节再解析产生的双倍瞬时占用
+      final wav = await readWavStreamed(path);
       samples = toMono16k(wav.samples, wav.sampleRate, wav.channels);
     } catch (e) {
       error = '读取录音文件失败：$e';
@@ -386,7 +452,7 @@ class RealtimeController extends ChangeNotifier {
     notifyListeners();
 
     final sw = Stopwatch()..start();
-    // 与上传转写一致：分离在检测到首段语音后与逐句识别并行
+    // 与上传转写一致：音频已全量读出，转写开始即与识别并行启动分离
     // 说话人标注开关在开始时快照
     final diarize = useDiarization;
     Future<List<DiarSegment>?>? diarFuture;
@@ -444,11 +510,25 @@ class RealtimeController extends ChangeNotifier {
 
     try {
       _vad.load(models.paths!.sileroVad);
-      await _retranscribeStream(
-        samples,
-        sw,
-        onFirstSpeech: launchDiarization,
-        onSegmentAdded: applySpeakers,
+      // 转写开始即并行启动分离，不等首段语音
+      launchDiarization();
+      await streamTranscribe(
+        samples: samples,
+        vad: _vad,
+        recognize: (speech) =>
+            models.asr.recognize(speech, punctuate: punctuationEnabled),
+        isCancelled: () => _retranscribeCancel,
+        isPaused: () => retranscribePaused,
+        maxInFlight: models.asr.workerCount * 2,
+        onSegment: (seg) {
+          _insertSegmentSorted(seg);
+          applySpeakers();
+        },
+        onProgress: (ratio) {
+          retranscribeProgress = ratio * 0.9;
+          _updateRetranscribeEta(sw, ratio);
+        },
+        onChanged: notifyListeners,
       );
       feedDone = true;
 
@@ -533,69 +613,13 @@ class RealtimeController extends ChangeNotifier {
     _retranscribeCancel = false;
   }
 
-  /// 与上传页一致的分段识别：按窗口粒度喂入 VAD，每产出一个语音段立即识别。
-  /// [onFirstSpeech] 在检测到首个语音段时触发（用于并行启动说话人分离）；
-  /// [onSegmentAdded] 在每个段落写入结果后触发（用于即时回填说话人标签）。
-  Future<void> _retranscribeStream(
-    Float32List samples,
-    Stopwatch sw, {
-    void Function()? onFirstSpeech,
-    void Function()? onSegmentAdded,
-  }) async {
-    const windowSize = 512;
-    const windowsPerYield = 32; // 约 1 秒让出一次事件循环
-    var fedSamples = 0;
-    var windows = 0;
-
-    Future<void> drainAndRecognize() async {
-      while (_vad.hasSegment) {
-        final s = _vad.front();
-        _vad.pop();
-        if (_retranscribeCancel) continue;
-        onFirstSpeech?.call();
-        while (retranscribePaused && !_retranscribeCancel) {
-          await Future<void>.delayed(const Duration(milliseconds: 120));
-        }
-        if (_retranscribeCancel) continue;
-        String text;
-        try {
-          text = await models.asr.recognize(
-            s.samples,
-            punctuate: punctuationEnabled,
-          );
-        } catch (e) {
-          text = '';
-          debugPrint('重新转写识别失败: $e');
-        }
-        if (text.isNotEmpty) {
-          segments.add(
-            TranscriptSegment(
-              startSec: s.start / VadEngine.sampleRate,
-              endSec: (s.start + s.samples.length) / VadEngine.sampleRate,
-              text: text,
-            ),
-          );
-          onSegmentAdded?.call();
-        }
-        notifyListeners();
-      }
+  /// 识别按段落派发、完成顺序乱序返回，按起点时间排序插入保持段落有序。
+  void _insertSegmentSorted(TranscriptSegment seg) {
+    var i = segments.length;
+    while (i > 0 && segments[i - 1].startSec > seg.startSec) {
+      i--;
     }
-
-    while (fedSamples < samples.length && !_retranscribeCancel) {
-      final end = (fedSamples + windowSize).clamp(0, samples.length);
-      _vad.acceptWaveform(Float32List.sublistView(samples, fedSamples, end));
-      fedSamples = end;
-      await drainAndRecognize();
-      retranscribeProgress = fedSamples / samples.length * 0.9;
-      _updateRetranscribeEta(sw, retranscribeProgress / 0.9);
-      if (++windows % windowsPerYield == 0) {
-        await Future<void>.delayed(Duration.zero);
-      }
-    }
-    _vad.flush();
-    await drainAndRecognize();
-    retranscribeProgress = 0.9;
-    _vad.free();
+    segments.insert(i, seg);
   }
 
   void _startRetranscribeTicker() {
@@ -622,7 +646,8 @@ class RealtimeController extends ChangeNotifier {
 
   void _onSamples(Float32List samples) {
     if (phase != RealtimePhase.recording || paused) return;
-    _chunks.add(samples);
+    // 边录边落盘：分片同步入队 IOSink（内部保序），不驻留内存
+    _writer?.append(samples);
     _totalSamples += samples.length;
 
     // 波形幅度
@@ -694,11 +719,15 @@ class RealtimeController extends ChangeNotifier {
     if (_incrDiarBusy || !recording || paused || _stopping) return;
     if (!_sessionDiarize || !models.diarizationAvailable) return;
     final durationSec = _totalSamples / VadEngine.sampleRate;
-    if (durationSec < _incrDiarIntervalSec ||
+    if (durationSec > _incrDiarMaxDurationSec ||
+        durationSec < _incrDiarIntervalSec ||
         durationSec - _incrDiarMarkSec < _incrDiarIntervalSec) {
       return;
     }
     final gen = _sessionGen;
+    final writer = _writer;
+    final draftPath = _draft?.audioPath;
+    if (writer == null || draftPath == null) return;
     _incrDiarBusy = true;
     _incrDiarMarkSec = durationSec;
     liveDiarizing = true;
@@ -707,7 +736,15 @@ class RealtimeController extends ChangeNotifier {
       final ok = await models.ensureDiarization();
       // 等待加载/计算期间可能已停止录音或开启新会话，结果作废
       if (!ok || !recording || gen != _sessionGen) return;
-      final diarSegs = await models.diarization.process(_snapshotSamples());
+      // 流式读回已录制前缀（头部尺寸为占位大值，按文件实际剩余读取），
+      // 零拷贝移交分离 isolate——全程只有一份音频驻留内存
+      await writer.flush();
+      final wav = await readWavStreamed(draftPath);
+      if (!recording || gen != _sessionGen || wav.samples.isEmpty) return;
+      final diarSegs = await models.diarization.process(
+        wav.samples,
+        transfer: true,
+      );
       if (!recording || gen != _sessionGen || diarSegs.isEmpty) return;
       segments = assignSpeakers(
         segments: segments,
@@ -728,34 +765,12 @@ class RealtimeController extends ChangeNotifier {
     }
   }
 
-  /// 非破坏性合并已录制音频（录音仍在继续，不能复用会清空缓冲的
-  /// [_mergeChunks]）。
-  Float32List _snapshotSamples() {
-    final out = Float32List(_totalSamples);
-    var offset = 0;
-    for (final c in _chunks) {
-      out.setAll(offset, c);
-      offset += c.length;
-    }
-    return out;
-  }
-
-  Float32List _mergeChunks() {
-    final out = Float32List(_totalSamples);
-    var offset = 0;
-    for (final c in _chunks) {
-      out.setAll(offset, c);
-      offset += c.length;
-    }
-    _chunks.clear();
-    return out;
-  }
-
   @override
   void dispose() {
     _ticker?.cancel();
     _retranscribeTicker?.cancel();
     _recorder.stop();
+    _writer?.abort();
     _vad.free();
     seekRequest.dispose();
     super.dispose();

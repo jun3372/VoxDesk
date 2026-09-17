@@ -8,6 +8,7 @@ import '../data/transcript_models.dart';
 import '../services/audio_decode_service.dart';
 import '../services/diarization_engine.dart';
 import '../services/history_service.dart';
+import '../services/transcribe_pipeline.dart';
 import '../services/vad_engine.dart';
 import 'model_controller.dart';
 
@@ -192,11 +193,11 @@ class UploadController extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// 开始转写：VAD 分段 → 逐句识别（流式回显）→ 保存历史。
+  /// 开始转写：VAD 分段 → 并发逐句识别（流式回显）→ 保存历史。
   ///
-  /// 说话人分离只依赖音频、不依赖识别结果，因此在检测到首段语音后即与
-  /// 逐句识别并行启动；文本先出、标签在分离完成后统一回填，整体耗时
-  /// 从「识别 + 分离」缩短为两者中较长者。
+  /// 说话人分离只依赖音频、不依赖识别结果，而音频已全量在内存中，
+  /// 因此转写一开始即与识别并行启动；文本先出、标签在分离完成后
+  /// 统一回填，整体耗时从「识别 + 分离」缩短为两者中较长者。
   Future<void> startTranscription() async {
     if (!canStart || _decoded == null) return;
     final samples = _decoded!;
@@ -271,11 +272,26 @@ class UploadController extends ChangeNotifier {
 
     try {
       _vad.load(p.sileroVad);
-      await _streamTranscribe(
-        samples,
-        sw,
-        onFirstSpeech: launchDiarization,
-        onSegmentAdded: applySpeakers,
+      // 音频已全量在内存：转写开始即并行启动分离，不等首段语音
+      // （识别提速后，分离模型的懒加载会成为尾部瓶颈）
+      launchDiarization();
+      await streamTranscribe(
+        samples: samples,
+        vad: _vad,
+        recognize: (speech) =>
+            models.asr.recognize(speech, punctuate: punctuationEnabled),
+        isCancelled: () => _cancelRequested,
+        isPaused: () => paused,
+        maxInFlight: models.asr.workerCount * 2,
+        onSegment: (seg) {
+          _insertSegmentSorted(seg);
+          applySpeakers();
+        },
+        onProgress: (ratio) {
+          progress = ratio * 0.9;
+          _updateEta(sw, ratio, 0.9);
+        },
+        onChanged: notifyListeners,
       );
       feedDone = true;
 
@@ -322,80 +338,20 @@ class UploadController extends ChangeNotifier {
       phase = UploadPhase.fileSelected;
     } finally {
       _ticker?.cancel();
+      _vad.free();
       paused = false;
       notifyListeners();
     }
   }
 
-  /// VAD 边检测边逐句识别：每产出一个语音段立即识别回显，
-  /// 首句结果无需等待整条音频检测完，耗时不再随音频变长而增加。
-  /// [onFirstSpeech] 在检测到首个语音段时触发（用于并行启动说话人分离）；
-  /// [onSegmentAdded] 在每个段落写入结果后触发（用于即时回填说话人标签）。
-  Future<void> _streamTranscribe(
-    Float32List samples,
-    Stopwatch sw, {
-    void Function()? onFirstSpeech,
-    void Function()? onSegmentAdded,
-  }) async {
-    // sherpa-onnx VAD 的状态机按「单窗口」粒度运行，段起点固定回看约
-    // 0.7s；一次喂入多个窗口会把起点错定位到块尾，吞掉块内更早的语音，
-    // 也无法在块内的静音处切段（官方注释 "n is usually window_size"）。
-    // 必须按窗口粒度小步喂入。
-    const windowSize = 512;
-    const windowsPerYield = 32; // 约 1 秒让出一次事件循环
-    var fedSamples = 0;
-    var windows = 0;
-
-    // 取出当前所有已完成的语音段并逐段识别回显。
-    Future<void> drainAndRecognize() async {
-      while (_vad.hasSegment) {
-        final s = _vad.front();
-        _vad.pop();
-        if (_cancelRequested) continue;
-        onFirstSpeech?.call();
-        while (paused && !_cancelRequested) {
-          await Future<void>.delayed(const Duration(milliseconds: 120));
-        }
-        if (_cancelRequested) continue;
-        String text;
-        try {
-          text = await models.asr.recognize(
-            s.samples,
-            punctuate: punctuationEnabled,
-          );
-        } catch (e) {
-          text = '';
-          debugPrint('段落识别失败: $e');
-        }
-        if (text.isNotEmpty) {
-          segments.add(
-            TranscriptSegment(
-              startSec: s.start / VadEngine.sampleRate,
-              endSec: (s.start + s.samples.length) / VadEngine.sampleRate,
-              text: text,
-            ),
-          );
-          onSegmentAdded?.call();
-        }
-        notifyListeners();
-      }
+  /// 识别按段落派发、完成顺序乱序返回，按起点时间排序插入保持段落有序。
+  /// 派发顺序本身是时间升序，倒序扫描通常一次即命中。
+  void _insertSegmentSorted(TranscriptSegment seg) {
+    var i = segments.length;
+    while (i > 0 && segments[i - 1].startSec > seg.startSec) {
+      i--;
     }
-
-    while (fedSamples < samples.length && !_cancelRequested) {
-      final end = (fedSamples + windowSize).clamp(0, samples.length);
-      _vad.acceptWaveform(Float32List.sublistView(samples, fedSamples, end));
-      fedSamples = end;
-      await drainAndRecognize();
-      progress = fedSamples / samples.length * 0.9;
-      _updateEta(sw, progress / 0.9, 0.9);
-      if (++windows % windowsPerYield == 0) {
-        await Future<void>.delayed(Duration.zero);
-      }
-    }
-    _vad.flush();
-    await drainAndRecognize();
-    progress = 0.9;
-    _vad.free();
+    segments.insert(i, seg);
   }
 
   void pause() {

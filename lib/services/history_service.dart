@@ -90,6 +90,25 @@ class HistoryService {
     );
   }
 
+  /// 实时会话两段式保存的第一步（流式落盘版）：仅创建草稿目录并返回
+  /// 录音文件路径，录音分片由 WavStreamWriter 边录边写入；此时不写
+  /// meta/transcript，历史列表不会出现该条目。
+  Future<RealtimeSessionDraft> beginRealtimeDraft({
+    required DateTime createdAt,
+    required String device,
+  }) async {
+    final id = DateTime.now().millisecondsSinceEpoch.toString();
+    final dir = _itemDir(id);
+    await dir.create(recursive: true);
+    return RealtimeSessionDraft(
+      id: id,
+      createdAt: createdAt,
+      durationSec: 0,
+      device: device,
+      audioPath: '${dir.path}${Platform.pathSeparator}session.wav',
+    );
+  }
+
   /// 实时会话两段式保存的第一步：仅落盘录音文件，供结束页立即回放；
   /// 此时不写 meta/transcript，历史列表不会出现该条目。
   Future<RealtimeSessionDraft> createRealtimeSessionDraft({
@@ -122,10 +141,12 @@ class HistoryService {
 
   /// 第二步：写入元信息与转写结果（含说话人标注后的最终文本），
   /// 条目自此作为唯一一份记录出现在历史列表。
+  /// [durationSec] 供边录边落盘的草稿在结束时传入真实时长。
   Future<HistoryItem> finalizeRealtimeSession(
     RealtimeSessionDraft draft,
-    List<TranscriptSegment> segments,
-  ) async {
+    List<TranscriptSegment> segments, {
+    double? durationSec,
+  }) async {
     final charCount = segments.fold<int>(
       0,
       (n, s) => n + s.text.replaceAll(' ', '').length,
@@ -135,7 +156,7 @@ class HistoryService {
       type: HistoryType.realtime,
       title: '实时转写会话',
       createdAt: draft.createdAt,
-      durationSec: draft.durationSec,
+      durationSec: durationSec ?? draft.durationSec,
       charCount: charCount,
       segmentCount: segments.length,
       device: draft.device,

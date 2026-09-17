@@ -63,15 +63,30 @@ class DiarizationEngine {
 
   /// 处理完整 16kHz 音频，返回说话人段列表。
   /// 多个调用按提交顺序串行执行。
+  ///
+  /// [transfer] 为 true 时采样缓冲零拷贝移交给 worker isolate，
+  /// 调用后调用方持有的 [samples] 立即失效、不得再使用；
+  /// 仅当音频为本次调用专门准备（如刚从磁盘读出）时才能开启。
   Future<List<DiarSegment>> process(
     Float32List samples, {
     void Function(int done, int total)? onProgress,
+    bool transfer = false,
   }) {
     final run = _sendQueue.then((_) {
       if (!_ready) throw StateError('说话人分离引擎尚未加载');
       _onProgress = onProgress;
       final c = _processCompleter = Completer<List<DiarSegment>>();
-      _send!.send({'type': 'process', 'samples': samples});
+      _send!.send({
+        'type': 'process',
+        'samples': transfer
+            ? TransferableTypedData.fromList([
+                samples.buffer.asUint8List(
+                  samples.offsetInBytes,
+                  samples.length * 4,
+                ),
+              ])
+            : samples,
+      });
       return c.future;
     });
     _sendQueue = run.then((_) {}, onError: (_) {});
@@ -169,7 +184,10 @@ Future<void> _workerMain(SendPort initial) async {
       case 'process':
         cancelRequested = false;
         try {
-          final samples = m['samples'] as Float32List;
+          final raw = m['samples'];
+          final samples = raw is TransferableTypedData
+              ? raw.materialize().asFloat32List()
+              : raw as Float32List;
           final segs = diar!.processWithCallback(
             samples: samples,
             // 回调返回非 0 时 sherpa-onnx 中止本次计算

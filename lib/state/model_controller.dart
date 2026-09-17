@@ -6,6 +6,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart' show MissingPluginException;
 
 import '../services/asr_engine.dart';
+import '../services/device_tuning.dart';
 import '../services/diarization_engine.dart';
 import '../services/model_manager.dart';
 
@@ -13,8 +14,13 @@ import '../services/model_manager.dart';
 class ModelController extends ChangeNotifier {
   final ModelManager _manager = ModelManager();
 
-  final AsrEngine asr = AsrEngine();
+  final AsrEnginePool asr = AsrEnginePool();
   final DiarizationEngine diarization = DiarizationEngine();
+
+  /// 设备算力探测结果（worker 数/线程数），首次加载引擎时计算并缓存。
+  DeviceTuning? _tuning;
+  Future<DeviceTuning> _deviceTuning() async =>
+      _tuning ??= await probeDeviceTuning();
 
   ModelPaths? paths;
   bool scanning = false;
@@ -127,14 +133,21 @@ class ModelController extends ChangeNotifier {
     if (coreReady && !asrReady) await loadEngines();
   }
 
-  /// 加载 ASR 引擎（FireRedAsr2 AED）。
+  /// 加载 ASR 引擎（FireRedAsr2 AED）。worker 数与线程数按设备算力
+  /// 自动调节（线程数 4 封顶；仅核数与内存都大幅充裕时才启用第 2 个
+  /// worker，取舍依据见 device_tuning.dart 的基准注释）。
   Future<void> loadEngines() async {
     if (loading || !coreReady || asrReady) return;
     loading = true;
     error = null;
     notifyListeners();
     try {
-      await asr.load(paths: paths!);
+      final tuning = await _deviceTuning();
+      await asr.load(
+        paths: paths!,
+        workers: tuning.asrWorkers,
+        numThreads: tuning.asrThreads,
+      );
       asrReady = true;
     } catch (e) {
       error = '模型加载失败：$e';
@@ -149,7 +162,8 @@ class ModelController extends ChangeNotifier {
     if (diarReady) return true;
     if (!diarizationAvailable) return false;
     try {
-      await diarization.load(paths: paths!);
+      final tuning = await _deviceTuning();
+      await diarization.load(paths: paths!, numThreads: tuning.diarThreads);
       diarReady = true;
       notifyListeners();
       return true;

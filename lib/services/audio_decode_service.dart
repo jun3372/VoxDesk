@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'package:audio_decoder/audio_decoder.dart';
@@ -30,14 +31,22 @@ class AudioDecodeService {
     return supportedExtensions.any(lower.endsWith);
   }
 
+  /// 解析 + 混音/重采样是纯 Dart 逐样本计算，长音频可达数亿样本，
+  /// 挪到 isolate 避免阻塞 UI 线程。
+  static Future<Float32List> _parseAndConvert(Uint8List bytes) {
+    return Isolate.run(() {
+      final wav = parseWav(bytes);
+      return toMono16k(wav.samples, wav.sampleRate, wav.channels);
+    });
+  }
+
   static Future<DecodedAudio> decodeToMono16k(String path) async {
     final file = File(path);
     if (!file.existsSync()) throw Exception('音频文件不存在: $path');
 
     if (path.toLowerCase().endsWith('.wav')) {
       try {
-        final wav = parseWav(await file.readAsBytes());
-        final samples = toMono16k(wav.samples, wav.sampleRate, wav.channels);
+        final samples = await _parseAndConvert(await file.readAsBytes());
         return DecodedAudio(
           samples: samples,
           durationSec: samples.length / 16000.0,
@@ -58,8 +67,7 @@ class AudioDecodeService {
         channels: 1,
         bitDepth: 16,
       );
-      final wav = parseWav(await File(tmp).readAsBytes());
-      final samples = toMono16k(wav.samples, wav.sampleRate, wav.channels);
+      final samples = await _parseAndConvert(await File(tmp).readAsBytes());
       return DecodedAudio(
         samples: samples,
         durationSec: samples.length / 16000.0,

@@ -2,11 +2,28 @@ import 'dart:typed_data';
 
 import 'package:sherpa_onnx/sherpa_onnx.dart' as sherpa;
 
+/// 语音段来源抽象：转写流水线（transcribe_pipeline.dart）依赖该接口，
+/// 便于测试时注入假 VAD。
+abstract class SegmentSource {
+  void acceptWaveform(Float32List window);
+
+  /// 是否已有完整的语音段可取。
+  bool get hasSegment;
+
+  /// 当前语音段（须先确认 [hasSegment]）。
+  ({Float32List samples, int start}) front();
+
+  void pop();
+
+  /// 结束输入流时冲出剩余语音段。
+  void flush();
+}
+
 /// Silero VAD 封装（16kHz 输入）。
 ///
 /// 语音段阈值/时长参数与 sherpa-onnx 官方 `vad-with-offline-asr` 示例一致，
 /// maxSpeechDuration 放宽到 15s 以减少句子被截断。
-class VadEngine {
+class VadEngine implements SegmentSource {
   sherpa.VoiceActivityDetector? _vad;
 
   static const int sampleRate = 16000;
@@ -34,17 +51,22 @@ class VadEngine {
 
   bool get loaded => _vad != null;
 
+  @override
   void acceptWaveform(Float32List samples) => _vad!.acceptWaveform(samples);
 
-  /// 是否已有完整的语音段可取。
+  @override
   bool get hasSegment => !(_vad?.isEmpty() ?? true);
 
-  /// 当前语音段（须先确认 [hasSegment]）。
-  sherpa.SpeechSegment front() => _vad!.front();
+  @override
+  ({Float32List samples, int start}) front() {
+    final s = _vad!.front();
+    return (samples: s.samples, start: s.start);
+  }
 
+  @override
   void pop() => _vad!.pop();
 
-  /// 结束输入流时冲出剩余语音段。
+  @override
   void flush() => _vad!.flush();
 
   void reset() => _vad?.reset();
