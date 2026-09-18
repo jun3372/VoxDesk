@@ -6,8 +6,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:voxdesk/services/wav_io.dart';
 
 /// 构造最小 PCM16 WAV 字节（RIFF + fmt + data）。
-Uint8List _wrapWav(Uint8List data, int sampleRate, int channels) {
-  Uint8List chunk(String id, Uint8List body) {
+Uint8List _wrapWav(Uint8List data, int sampleRate, int channels) {  Uint8List chunk(String id, Uint8List body) {
     final head = ByteData(8)..setUint32(4, body.length, Endian.little);
     final b = head.buffer.asUint8List();
     b.setRange(0, 4, id.codeUnits);
@@ -37,6 +36,44 @@ Uint8List _wrapWav(Uint8List data, int sampleRate, int channels) {
         ..add(headBytes)
         ..add(fmtChunk)
         ..add(dataChunk))
+      .toBytes();
+}
+
+/// 构造 IEEE Float32 WAV 字节（formatTag=3，单声道 16kHz）。
+/// [misalign] 为 true 时在 fmt 前放置 size=6 的 LIST 块（偶数长度、无
+/// 填充字节），使 data 块起始偏移 %4 = 2。
+Uint8List _wrapFloat32Wav(Float32List samples, {bool misalign = false}) {
+  final b = BytesBuilder();
+  void chunkId(String id) => b.add(id.codeUnits);
+  void u16(int v) =>
+      b.add((ByteData(2)..setUint16(0, v, Endian.little)).buffer.asUint8List());
+  void u32(int v) =>
+      b.add((ByteData(4)..setUint32(0, v, Endian.little)).buffer.asUint8List());
+
+  if (misalign) {
+    chunkId('LIST');
+    u32(6);
+    b.add([1, 2, 3, 4, 5, 6]);
+  }
+  chunkId('fmt ');
+  u32(16);
+  u16(3); // IEEE float
+  u16(1); // 单声道
+  u32(16000);
+  u32(64000);
+  u16(4);
+  u16(32);
+  chunkId('data');
+  u32(samples.length * 4);
+  b.add(samples.buffer.asUint8List());
+
+  final head = ByteData(12)..setUint32(4, b.length, Endian.little);
+  final headBytes = head.buffer.asUint8List();
+  headBytes.setRange(0, 4, 'RIFF'.codeUnits);
+  headBytes.setRange(8, 12, 'WAVE'.codeUnits);
+  return (BytesBuilder()
+        ..add(headBytes)
+        ..add(b.toBytes()))
       .toBytes();
 }
 
@@ -94,6 +131,28 @@ void main() {
       expect(wav.samples.length, 5);
       for (var i = 0; i < 5; i++) {
         expect(wav.samples[i], closeTo(ints[i] / 32768.0, 1e-9));
+      }
+    });
+
+    test('float32 WAV：data 块对齐时视图路径解析正确', () {
+      final samples = Float32List.fromList([0.1, -0.2, 0.3, -0.4]);
+      final wav = parseWav(_wrapFloat32Wav(samples));
+      expect(wav.sampleRate, 16000);
+      expect(wav.channels, 1);
+      expect(wav.samples.length, samples.length);
+      for (var i = 0; i < samples.length; i++) {
+        expect(wav.samples[i], closeTo(samples[i], 1e-6));
+      }
+    });
+
+    test('float32 WAV：data 块偏移非 4 对齐时仍可解析（回归：RangeError）', () {
+      // data 块从拷贝改为视图后，Float32List.view 要求偏移按 4 字节对齐；
+      // 前置奇长元数据块（如 LIST size=6）会使偏移 %4 = 2
+      final samples = Float32List.fromList([0.1, -0.2, 0.3, -0.4]);
+      final wav = parseWav(_wrapFloat32Wav(samples, misalign: true));
+      expect(wav.samples.length, samples.length);
+      for (var i = 0; i < samples.length; i++) {
+        expect(wav.samples[i], closeTo(samples[i], 1e-6));
       }
     });
   });

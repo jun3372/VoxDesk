@@ -25,13 +25,16 @@ class DeviceTuning {
 /// 4 线程（性能核数）最优，更多线程受内存带宽与能效核拖累反而变慢；
 /// 而在 8 核机上再加第 2 个 worker（4+4 线程并发解码）吞吐仅 +15%，
 /// 内存却翻倍（每 worker 独立加载一份模型）。因此线程数按 4 封顶；
-/// 仅当核数远超 4（能再容下一整个 worker 的 4 线程）且内存充裕时才
-/// 启用第 2 个 worker。内存读不到时只按核数判断。
+/// 仅当核数远超 4（能再容下一整个 worker 的 4 线程）且内存确认充裕时才
+/// 启用第 2 个 worker。内存读不到时保守按 1 worker：12 核低内存机器若
+/// 贸然开双 worker，两份模型加载会在 ONNX 原生层 OOM，进程直接崩溃
+/// （原生 OOM 没有 Dart 异常可捕获）。
+///
+/// 分离只分一半核数：与 ASR 并行跑时避免过度争抢。
 Future<DeviceTuning> probeDeviceTuning() async {
   final cores = Platform.numberOfProcessors;
   final ramGb = await _totalMemoryGb();
-  final workers =
-      cores >= 12 && (ramGb == null || ramGb >= 16) ? 2 : 1;
+  final workers = cores >= 12 && ramGb != null && ramGb >= 16 ? 2 : 1;
   return DeviceTuning(
     asrWorkers: workers,
     asrThreads: _clampInt(cores ~/ workers, 2, 4),
@@ -42,7 +45,7 @@ Future<DeviceTuning> probeDeviceTuning() async {
 
 int _clampInt(int v, int lo, int hi) => v < lo ? lo : (v > hi ? hi : v);
 
-/// 读取物理内存总量（GB），读不到返回 null（调用方按核数保守估计）。
+/// 读取物理内存总量（GB），读不到返回 null（调用方按保守策略处理）。
 Future<double?> _totalMemoryGb() async {
   try {
     if (Platform.isMacOS) {

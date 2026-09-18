@@ -115,13 +115,19 @@ class RealtimeController extends ChangeNotifier {
   // 「上一轮未结束则跳过」的自然背控制 CPU 占用。
   static const int _incrDiarIntervalSec = 45;
 
-  /// 增量分离只在前 30 分钟内进行：每轮需把已录制前缀整段读入内存，
-  /// 不设上限会随录音时长线性增长；超过阈值后新段落暂不预标注，
-  /// 结束时全量分离仍会补齐全部说话人标签（最终结果不变）。
-  static const int _incrDiarMaxDurationSec = 30 * 60;
+  /// 增量分离只在前 5 分钟内进行：每轮需把已录制前缀整段读入并与识别
+  /// 并行计算，单轮耗时随前缀线性增长（实测 RTF 约 0.3，5 分钟前缀
+  /// 单轮已需 1-2 分钟），再拉长会背靠背连续运行、持续挤压识别导致
+  /// 转写结果停更；超过阈值后新段落暂不预标注，结束时全量分离仍会
+  /// 补齐全部说话人标签（最终结果不变）。
+  static const int _incrDiarMaxDurationSec = 5 * 60;
   int _sessionGen = 0;
   bool _incrDiarBusy = false;
   double _incrDiarMarkSec = 0;
+
+  /// 上一轮增量分离的耗时（秒）：下一轮的间隔随之自适应拉长，把分离
+  /// 的 CPU 占空比控制在约 1/3，避免与识别长期争抢拖慢转写输出。
+  double _lastIncrDiarCostSec = 0;
 
   /// 说话人标注开关在会话开始时快照，会话内不响应选项变化。
   bool _sessionDiarize = false;
@@ -150,6 +156,7 @@ class RealtimeController extends ChangeNotifier {
     _sessionGen++;
     _incrDiarBusy = false;
     _incrDiarMarkSec = 0;
+    _lastIncrDiarCostSec = 0;
     liveDiarizing = false;
     _sessionDiarize = useDiarization;
     final started = DateTime.now();
@@ -452,7 +459,8 @@ class RealtimeController extends ChangeNotifier {
     notifyListeners();
 
     final sw = Stopwatch()..start();
-    // 与上传转写一致：音频已全量读出，转写开始即与识别并行启动分离
+    // 与上传转写一致：分离模型与识别并行预加载，分离重计算与识别串行
+    // （两者并行会因内存带宽互踩导致转写结果长时间停更）
     // 说话人标注开关在开始时快照
     final diarize = useDiarization;
     Future<List<DiarSegment>?>? diarFuture;
@@ -510,8 +518,10 @@ class RealtimeController extends ChangeNotifier {
 
     try {
       _vad.load(models.paths!.sileroVad);
-      // 转写开始即并行启动分离，不等首段语音
-      launchDiarization();
+      // 分离模型与识别并行预加载（仅加载）；重计算识别完成后再跑
+      if (diarize && models.diarizationAvailable) {
+        unawaited(models.ensureDiarization());
+      }
       await streamTranscribe(
         samples: samples,
         vad: _vad,
@@ -532,18 +542,18 @@ class RealtimeController extends ChangeNotifier {
       );
       feedDone = true;
 
-      // —— 与识别并行的说话人分离收尾 ——
+      // —— 识别完成后再跑说话人分离（与识别串行）——
+      final diarUsable = diarize &&
+          models.diarizationAvailable &&
+          samples.length > VadEngine.sampleRate * 3;
       List<DiarSegment>? diarSegs;
-      if (diarFuture != null) {
-        if (_retranscribeCancel) {
-          models.diarization.cancel();
-        } else {
-          stageLabel = '说话人分离中';
-          notifyListeners();
-          diarSegs = await diarFuture!;
-        }
+      if (diarUsable && !_retranscribeCancel) {
+        stageLabel = '说话人分离中';
+        notifyListeners();
+        diarSegs = await launchDiarization();
+      } else if (diarUsable) {
+        models.diarization.cancel();
       }
-      // 分离完成时通常已即时回填；此处兜底（如最后一批段落晚于分离完成）
       if (!_retranscribeCancel && diarSegs != null && diarSegs.isNotEmpty) {
         applySpeakers();
       }
@@ -719,9 +729,14 @@ class RealtimeController extends ChangeNotifier {
     if (_incrDiarBusy || !recording || paused || _stopping) return;
     if (!_sessionDiarize || !models.diarizationAvailable) return;
     final durationSec = _totalSamples / VadEngine.sampleRate;
+    // 轮间隔随上轮耗时自适应（占空比 ≤ 1/3）：分离与识别争抢会拖慢
+    // 转写输出，上一轮跑得越久，越要让识别多喘息
+    final minGapSec = _lastIncrDiarCostSec * 2 > _incrDiarIntervalSec
+        ? _lastIncrDiarCostSec * 2
+        : _incrDiarIntervalSec.toDouble();
     if (durationSec > _incrDiarMaxDurationSec ||
         durationSec < _incrDiarIntervalSec ||
-        durationSec - _incrDiarMarkSec < _incrDiarIntervalSec) {
+        durationSec - _incrDiarMarkSec < minGapSec) {
       return;
     }
     final gen = _sessionGen;
@@ -732,6 +747,7 @@ class RealtimeController extends ChangeNotifier {
     _incrDiarMarkSec = durationSec;
     liveDiarizing = true;
     notifyListeners();
+    final cost = Stopwatch()..start();
     try {
       final ok = await models.ensureDiarization();
       // 等待加载/计算期间可能已停止录音或开启新会话，结果作废
@@ -757,6 +773,8 @@ class RealtimeController extends ChangeNotifier {
     } catch (e) {
       debugPrint('增量说话人分离失败: $e');
     } finally {
+      // 成败都记录耗时：下一轮的间隔按真实 CPU 开销自适应
+      _lastIncrDiarCostSec = cost.elapsedMilliseconds / 1000.0;
       _incrDiarBusy = false;
       if (gen == _sessionGen) {
         liveDiarizing = false;

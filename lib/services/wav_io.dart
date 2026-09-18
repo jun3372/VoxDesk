@@ -102,11 +102,21 @@ WavData parseWav(Uint8List bytes) {
   } else if (formatTag == 3) {
     if (bits == 32) {
       final n = data.length ~/ 4;
-      samples = Float32List.view(
-        data.buffer,
-        data.offsetInBytes,
-        n,
-      ).sublist(0, n);
+      // 视图要求 4 字节对齐：data 块起始偏移非对齐时（前置奇长元数据块）
+      // 退回逐样本读取，与 PCM16 分支的对齐保护一致
+      if (Endian.host == Endian.little && data.offsetInBytes % 4 == 0) {
+        samples = Float32List.view(
+          data.buffer,
+          data.offsetInBytes,
+          n,
+        ).sublist(0, n);
+      } else {
+        final dv = ByteData.sublistView(data);
+        samples = Float32List(n);
+        for (var i = 0; i < n; i++) {
+          samples[i] = dv.getFloat32(i * 4, Endian.little);
+        }
+      }
     } else if (bits == 64) {
       final n = data.length ~/ 8;
       final dv = ByteData.sublistView(data);

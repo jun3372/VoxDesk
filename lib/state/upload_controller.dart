@@ -193,11 +193,11 @@ class UploadController extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// 开始转写：VAD 分段 → 并发逐句识别（流式回显）→ 保存历史。
+  /// 开始转写：VAD 分段 → 并发逐句识别（流式回显）→ 说话人分离 → 保存历史。
   ///
-  /// 说话人分离只依赖音频、不依赖识别结果，而音频已全量在内存中，
-  /// 因此转写一开始即与识别并行启动；文本先出、标签在分离完成后
-  /// 统一回填，整体耗时从「识别 + 分离」缩短为两者中较长者。
+  /// 分离模型在识别期间并行预加载，但分离重计算与识别串行（识别完成后再
+  /// 跑）：实测两者并行会因内存带宽互踩——分离跑多久、识别结果就停多久，
+  /// 总耗时反而比串行长。文本先流式回显、分离完成后统一回填说话人标签。
   Future<void> startTranscription() async {
     if (!canStart || _decoded == null) return;
     final samples = _decoded!;
@@ -272,9 +272,13 @@ class UploadController extends ChangeNotifier {
 
     try {
       _vad.load(p.sileroVad);
-      // 音频已全量在内存：转写开始即并行启动分离，不等首段语音
-      // （识别提速后，分离模型的懒加载会成为尾部瓶颈）
-      launchDiarization();
+      // 分离模型与识别并行预加载（仅加载、几乎不占算力）；分离重计算
+      // 必须与识别串行——实测两者并行会因内存带宽互踩，分离跑多久识别
+      // 就停多久（6.4 分钟音频的结果输出空窗达 77-133s），串行的总耗时
+      // 反而更短、结果输出平滑
+      if (diarize && p.diarizationReady) {
+        unawaited(models.ensureDiarization());
+      }
       await streamTranscribe(
         samples: samples,
         vad: _vad,
@@ -295,18 +299,17 @@ class UploadController extends ChangeNotifier {
       );
       feedDone = true;
 
-      // —— 与识别并行的说话人分离收尾 ——
+      // —— 识别完成后再跑说话人分离（与识别串行，见前述说明）——
+      final diarUsable =
+          diarize && p.diarizationReady && samples.length > 16000 * 3;
       List<DiarSegment>? diarSegs;
-      if (diarFuture != null) {
-        if (_cancelRequested) {
-          models.diarization.cancel();
-        } else {
-          stageLabel = '说话人分离中';
-          notifyListeners();
-          diarSegs = await diarFuture!;
-        }
+      if (diarUsable && !_cancelRequested) {
+        stageLabel = '说话人分离中';
+        notifyListeners();
+        diarSegs = await launchDiarization();
+      } else if (diarUsable) {
+        models.diarization.cancel();
       }
-      // 分离完成时通常已即时回填；此处兜底（如最后一批段落晚于分离完成）
       if (!_cancelRequested && diarSegs != null && diarSegs.isNotEmpty) {
         applySpeakers();
       }
