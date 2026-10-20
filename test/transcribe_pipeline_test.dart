@@ -180,5 +180,34 @@ void main() {
       expect(result.length, 1);
       expect(result.single.text, '有内容');
     });
+
+    test('段落识别异常通过 onSegmentError 上浮且不中断后续段落', () async {
+      final vad = FakeVad();
+      final samples = Float32List(512 * 20); // 2 段
+      final result = <TranscriptSegment>[];
+      final errors = <Object>[];
+      var calls = 0;
+
+      await streamTranscribe(
+        samples: samples,
+        vad: vad,
+        recognize: (speech) async {
+          calls++;
+          if (calls == 1) throw StateError('引擎故障');
+          return '有内容';
+        },
+        isCancelled: () => false,
+        isPaused: () => false,
+        onSegment: result.add,
+        onProgress: (_) {},
+        onChanged: () {},
+        onSegmentError: errors.add,
+      );
+
+      expect(result.length, 1);
+      expect(result.single.text, '有内容');
+      expect(errors.length, 1);
+      expect(errors.single, isA<StateError>());
+    });
   });
 }

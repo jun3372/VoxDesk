@@ -16,6 +16,10 @@ import 'vad_engine.dart';
 ///
 /// 取消（[isCancelled]）时停止喂入并丢弃未完成结果；暂停（[isPaused]）
 /// 只暂停喂入，在途识别继续。
+///
+/// [onSegmentError] 在某段识别抛出异常时回调（该段被丢弃、继续识别
+/// 后续段落）；调用方据此统计失败并在全部失败时向用户报错，否则
+/// 整场失败会表现为「转写完成」但结果为空、导出按钮置灰。
 Future<void> streamTranscribe({
   required Float32List samples,
   required SegmentSource vad,
@@ -25,6 +29,7 @@ Future<void> streamTranscribe({
   required void Function(TranscriptSegment segment) onSegment,
   required void Function(double fedRatio) onProgress,
   required void Function() onChanged,
+  void Function(Object error)? onSegmentError,
   int maxInFlight = 2,
 }) async {
   // sherpa-onnx VAD 的状态机按「单窗口」粒度运行，段起点固定回看约
@@ -68,6 +73,7 @@ Future<void> streamTranscribe({
           } catch (e) {
             text = '';
             log('段落识别失败: $e', name: 'transcribe');
+            onSegmentError?.call(e);
           }
           if (!isCancelled() && text.isNotEmpty) {
             onSegment(

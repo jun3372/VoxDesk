@@ -14,7 +14,9 @@ import 'model_manager.dart';
 class AsrEngine {
   Isolate? _isolate;
   ReceivePort? _port;
+  ReceivePort? _exitPort;
   StreamSubscription<dynamic>? _sub;
+  StreamSubscription<dynamic>? _exitSub;
   SendPort? _send;
 
   Map<String, dynamic>? _pendingInit;
@@ -42,7 +44,17 @@ class AsrEngine {
     final port = ReceivePort();
     _port = port;
     _sub = port.listen(_onMessage);
-    _isolate = await Isolate.spawn(_workerMain, port.sendPort);
+    // worker 崩溃退出时通过 onExit 让挂起的请求报错而非永久悬挂
+    // （isolate 死亡只是静默关闭 ReceivePort，监听方感知不到）
+    final exitPort = ReceivePort();
+    _exitPort = exitPort;
+    final spawned = await Isolate.spawn(
+      _workerMain,
+      port.sendPort,
+      onExit: exitPort.sendPort,
+    );
+    _isolate = spawned;
+    _exitSub = exitPort.listen((_) => _onWorkerDied(spawned));
 
     return ready.future.timeout(
       const Duration(minutes: 10),
@@ -69,6 +81,7 @@ class AsrEngine {
   }
 
   Future<void> quit() async {
+    _ready = false;
     if (_send != null && _isolate != null) {
       _send!.send({'type': 'quit'});
       // 给 worker 一点时间清理 FFI 资源
@@ -77,6 +90,8 @@ class AsrEngine {
     _isolate?.kill(priority: Isolate.beforeNextEvent);
     await _sub?.cancel();
     _port?.close();
+    await _exitSub?.cancel();
+    _exitPort?.close();
     for (final c in _pending.values) {
       if (!c.isCompleted) c.complete('');
     }
@@ -85,7 +100,23 @@ class AsrEngine {
     _port = null;
     _sub = null;
     _send = null;
+  }
+
+  /// worker isolate 崩溃退出：让加载与挂起的识别请求立即报错。
+  /// isolate 已被 quit 或新一次 load 取代时忽略本次退出事件。
+  void _onWorkerDied(Isolate isolate) {
+    if (_isolate != isolate) return;
+    _isolate = null;
+    final loading = _readyCompleter != null && !_readyCompleter!.isCompleted;
     _ready = false;
+    if (loading) {
+      _readyCompleter!.completeError(Exception('ASR worker 在模型加载中崩溃退出'));
+      return;
+    }
+    for (final c in _pending.values) {
+      if (!c.isCompleted) c.completeError(Exception('ASR worker 已崩溃退出'));
+    }
+    _pending.clear();
   }
 
   void _onMessage(dynamic msg) {
@@ -255,12 +286,19 @@ class AsrEnginePool {
     }
     final index = best;
     _inFlight[index]++;
-    return _workers[index]
-        .recognize(samples, punctuate: punctuate)
-        // quit 后挂起请求以空串完成，此时 _inFlight 可能已清空
-        .whenComplete(() {
-          if (index < _inFlight.length) _inFlight[index]--;
-        });
+    try {
+      return _workers[index]
+          .recognize(samples, punctuate: punctuate)
+          // quit 后挂起请求以空串完成，此时 _inFlight 可能已清空
+          .whenComplete(() {
+            if (index < _inFlight.length) _inFlight[index]--;
+          });
+    } catch (_) {
+      // worker 已崩溃等同步异常：回滚在途计数，避免该 worker 被视为
+      // 永久满载、后续请求全部绕开它
+      if (index < _inFlight.length) _inFlight[index]--;
+      rethrow;
+    }
   }
 
   Future<void> quit() async {
