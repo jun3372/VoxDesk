@@ -104,7 +104,8 @@ build-linux-docker: ## 在 Docker 中构建 Linux 版（模型自动内置并打
 			&& flutter pub get && flutter build linux \
 			&& BUNDLE=$$(find build/linux -type d -path "*release/bundle" | head -1) \
 			&& mv $$BUNDLE/voxdesk $$BUNDLE/voxdesk.bin \
-			&& cp /work/docker/linux-launcher.sh $$BUNDLE/voxdesk && chmod +x $$BUNDLE/voxdesk'
+			&& cp /work/docker/linux-launcher.sh $$BUNDLE/voxdesk && chmod +x $$BUNDLE/voxdesk \
+			&& bash scripts/bundle_stdlib.sh "$$BUNDLE"'
 	-./scripts/bundle_models.sh "$$(find build/linux -type d -path '*release/bundle' | head -1)"
 	# 打成发布压缩包：bundle 目录改名为 voxdesk（解压得到 voxdesk/，兼容
 	# macOS bsdtar 与 Linux GNU tar），版本号取自 pubspec.yaml，架构取

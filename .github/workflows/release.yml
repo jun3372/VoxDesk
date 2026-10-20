@@ -18,10 +18,15 @@
 #   - 推送 v* 标签触发，workflow_dispatch 手动触发
 #   - concurrency 并发组避免重复构建
 #
-# Linux 产物要求 glibc ≤ 2.28（兼容统信 UOS 20）：ubuntu-latest 的 glibc
-# 是 2.39，直接构建的产物在 UOS 上无法运行，因此整个 job 在 debian:buster
-# 容器（glibc 2.28）中执行，系统依赖清单与 docker/linux-builder.Dockerfile
-# 保持一致，并额外用 objdump 校验产物的最高 GLIBC 符号版本。
+# Linux 产物要求 glibc ≥ 2.18（Flutter 引擎的硬性下限）：可运行于统信
+# UOS 20 / Debian 10 / Ubuntu 16.04 及以后（CentOS 7 的 2.17 低于引擎要求，
+# 除外）。ubuntu-latest 的 glibc 是 2.39，构建中若引用高版本符号，产物无法
+# 在老系统运行，因此整个 job 在 debian:buster 容器（glibc 2.28）中执行——
+# 实测产物最高只引用 GLIBC_2.18（引擎库）。产物要求的 GLIBCXX_3.4.22 高于
+# Ubuntu 16.04 等老发行版的系统 libstdc++，由 scripts/bundle_stdlib.sh 把
+# 容器的 libstdc++ / libgcc_s 随包内置、启动器前置 LD_LIBRARY_PATH 解决。
+# 系统依赖清单与 docker/linux-builder.Dockerfile 保持一致，并用 objdump
+# 校验产物（含随包库）的最高 GLIBC 符号版本。
 #
 # 用法：
 #   发布：git tag v1.0.0 && git push origin v1.0.0（标签须与 pubspec.yaml 的
@@ -50,9 +55,9 @@ env:
   FLUTTER_VERSION: '3.47.4'
 
 jobs:
-  # ---------------- Linux（glibc 2.28：debian:buster 容器内构建，x64 + arm64） ----------------
+  # ---------------- Linux（glibc ≥ 2.18：debian:buster 容器内构建，x64 + arm64） ----------------
   build-linux:
-    name: Linux ${{ matrix.arch }} (glibc 2.28)
+    name: Linux ${{ matrix.arch }} (glibc 2.18)
     strategy:
       fail-fast: false
       matrix:
@@ -67,9 +72,10 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     container:
-      # glibc 2.28，与 UOS 20 对齐；更高版本容器（如 ubuntu:24.04 / glibc 2.39）
-      # 构建的产物无法在 UOS 20 上运行。官方镜像为多架构 manifest，按 runner
-      # 架构自动拉取 amd64 / arm64 变体
+      # glibc 2.28 的构建环境：实测产物最高只引用 GLIBC_2.18（引擎库），
+      # 即可满足老系统；更高版本容器（如 ubuntu:24.04 / glibc 2.39）构建的
+      # 产物会引用更高版本符号、无法在老系统运行。官方镜像为多架构
+      # manifest，按 runner 架构自动拉取 amd64 / arm64 变体
       image: debian:buster
 
     steps:
@@ -137,16 +143,24 @@ jobs:
           cp docker/linux-launcher.sh "$BUNDLE/voxdesk"
           chmod +x "$BUNDLE/voxdesk"
 
-          # 校验产物最高 GLIBC 符号依赖 ≤ 2.28（兼容 UOS 20 的红线）
-          MAX=0
-          for so in "$BUNDLE/voxdesk.bin" "$BUNDLE"/lib/*.so; do
+          # 随包内置 libstdc++ / libgcc_s（老发行版系统 libstdc++ 低于产物
+          # 要求的 GLIBCXX_3.4.22；启动器会把 bundle/lib 前置到 LD_LIBRARY_PATH）
+          bash scripts/bundle_stdlib.sh "$BUNDLE"
+
+          # 校验产物最高 GLIBC 符号依赖 ≤ 2.18（Flutter 引擎下限的红线；
+          # 含随包内置的 libstdc++ / libgcc_s）
+          ALL=""
+          # glob 用 *.so*：随包 libstdc++.so.6 / libgcc_s.so.1 以版本号结尾，
+          # *.so 匹配不到
+          for so in "$BUNDLE/voxdesk.bin" "$BUNDLE"/lib/*.so*; do
             [ -e "$so" ] || continue
             M=$(objdump -T "$so" | grep -oE 'GLIBC_[0-9.]+' | sed 's/^GLIBC_//' | sort -uV | tail -1)
             echo "$(basename "$so"): 最高 GLIBC_${M:-none}"
-            [ -n "$M" ] && MAX=$M
+            ALL="$ALL ${M:-}"
           done
-          if [ "$(printf '%s\n' '2.28' "$MAX" | sort -V | tail -1)" != "2.28" ]; then
-            echo "✗ 产物依赖 GLIBC_$MAX，超出 2.28 上限"; exit 1
+          MAX=$(printf '%s\n' $ALL | sort -uV | tail -1)
+          if [ "$(printf '%s\n' '2.18' "$MAX" | sort -V | tail -1)" != "2.18" ]; then
+            echo "✗ 产物依赖 GLIBC_$MAX，超出 2.18 上限"; exit 1
           fi
 
           VER=$(sed -nE 's/^version:[[:space:]]*([0-9.]+).*/\1/p' pubspec.yaml | head -1)
@@ -327,8 +341,8 @@ jobs:
           | 平台 | 安装包 | 免安装压缩包 | 说明 |
           | --- | --- | --- | --- |
           | Windows x64 | `voxdesk-windows-x64-v*-setup.exe` | `voxdesk-windows-x64-v*.zip` | 安装包：中文向导、装到 `%LocalAppData%\Programs\VoxDesk`、带开始菜单 / 可选桌面快捷方式 |
-          | Linux x64 | `voxdesk-linux-x64-v*.deb` | `voxdesk-linux-x64-v*.tar.gz` | **要求 glibc ≥ 2.28**，兼容统信 UOS 20 等旧系统 |
-          | Linux arm64 | `voxdesk-linux-arm64-v*.deb` | `voxdesk-linux-arm64-v*.tar.gz` | 飞腾 / 鲲鹏等 arm64 主机（含 UOS arm64 版），同样要求 glibc ≥ 2.28 |
+          | Linux x64 | `voxdesk-linux-x64-v*.deb` | `voxdesk-linux-x64-v*.tar.gz` | **要求 glibc ≥ 2.18**（libstdc++ 已内置），兼容统信 UOS 20 / Ubuntu 16.04 等旧系统 |
+          | Linux arm64 | `voxdesk-linux-arm64-v*.deb` | `voxdesk-linux-arm64-v*.tar.gz` | 飞腾 / 鲲鹏等 arm64 主机（含 UOS arm64 版），同样要求 glibc ≥ 2.18 |
           | macOS Apple Silicon | `voxdesk-macos-arm64-v*.dmg` | `voxdesk-macos-arm64-v*.zip` | 未签名，首次打开需放行（见下） |
 
           ### 模型放置（三选一）
@@ -359,7 +373,9 @@ jobs:
           ./voxdesk
           ```
 
-          - 基于 debian:buster 构建，最高仅依赖 GLIBC 2.28（UOS 20 / Debian 10 / CentOS 8 及以后均可运行）
+          - 基于 debian:buster 构建，要求 GLIBC ≥ 2.18（Flutter 引擎硬性下限；
+            UOS 20 / Debian 10 / Ubuntu 16.04 及以后均可运行，CentOS 7 的 2.17
+            不满足）。libstdc++ / libgcc 已随包内置，无需系统安装较新 GCC 运行库
           - 运行时依赖 GTK3 / GStreamer / PulseAudio / ALSA：
             `sudo apt install libgtk-3-0 gstreamer1.0-plugins-good gstreamer1.0-libav libpulse0 libasound2`
           - 默认软件渲染（适配云桌面 / 无 GPU 环境）；有可用 GPU 时可

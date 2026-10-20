@@ -19,4 +19,10 @@ cd "$(dirname "$0")" || exit 1
 
 export FLUTTER_LINUX_RENDERER="${FLUTTER_LINUX_RENDERER:-software}"
 
+# 优先加载随包内置的 libstdc++/libgcc（scripts/bundle_stdlib.sh 拷入 lib/）：
+# glibc ≥ 2.18 的老发行版（Ubuntu 16.04 等）系统 libstdc++ 低于产物要求的
+# GLIBCXX_3.4.22；新系统上亦无碍，库仅对本进程生效
+LD_LIBRARY_PATH="$(pwd)/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export LD_LIBRARY_PATH
+
 exec ./voxdesk.bin "$@"

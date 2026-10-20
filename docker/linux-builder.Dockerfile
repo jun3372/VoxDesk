@@ -4,11 +4,14 @@
 #   make linux-image          # 构建镜像（仅系统工具链）
 #   make build-linux-docker   # 在容器中构建 Linux 版
 #
-# 兼容性：基础镜像 debian:buster 的 glibc 为 2.28，与目标系统
-# 统信 UOS 20（glibc 2.28.x-deepin）一致；在更高版本 glibc 的镜像
-# （如 ubuntu:24.04 / glibc 2.39）中构建的产物无法在 UOS 20 上运行。
-# Flutter 工具链（dart / gen_snapshot，GLIBC_2.18）与官方 engine 产物
-# （libflutter_linux_gtk.so，GLIBC_2.18）均满足 2.28。
+# 兼容性：产物要求 glibc ≥ 2.18（Flutter 官方 engine / Dart 产物的硬性下限，
+# 实测 libflutter_linux_gtk.so 与 dart / gen_snapshot 最高只引用 GLIBC_2.18），
+# 覆盖统信 UOS 20 / Debian 10 / Ubuntu 16.04 及以后（CentOS 7 的 2.17 不满足）。
+# 构建镜像用 debian:buster（glibc 2.28）：更高版本镜像（如 ubuntu:24.04 /
+# glibc 2.39）构建的产物会引用更高版本符号、无法在老系统运行；buster 本身
+# 只约束「构建机能跑」，产物符号版本由实际用到的函数决定。老发行版系统
+# libstdc++ 低于产物要求（GLIBCXX_3.4.22），由 scripts/bundle_stdlib.sh 把
+# 本镜像的 libstdc++ / libgcc_s（自身最高 GLIBC_2.18）随包内置解决。
 #
 # Flutter SDK 不打进镜像：运行时把宿主机的 .flutter 克隆
 # （https://mirrors.tuna.tsinghua.edu.cn/git/flutter-sdk.git，stable 分支）
