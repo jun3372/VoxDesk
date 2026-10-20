@@ -54,7 +54,7 @@ class SavePanelPlugin: NSObject, FlutterPlugin {
       name: "voxdesk/save_panel",
       binaryMessenger: registrar.messenger
     )
-    registrar.addMethodCallHandler(instance, channel: channel)
+    registrar.addMethodCallDelegate(instance, channel: channel)
   }
 
   func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
