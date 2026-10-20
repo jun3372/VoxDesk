@@ -2,7 +2,9 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:file_picker/file_picker.dart';
+import 'package:file_selector/file_selector.dart' as file_selector;
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart' show MissingPluginException;
 
 import '../data/transcript_models.dart';
 import '../services/audio_decode_service.dart';
@@ -71,8 +73,27 @@ class UploadController extends ChangeNotifier {
 
   Future<void> pickFile() async {
     try {
-      final file = await FilePicker.pickFile(dialogTitle: '选择音频文件');
-      final path = file?.path;
+      // file_picker 的 Linux 实现直连 xdg-desktop-portal（D-Bus），离网或未装
+      // portal 的系统会直接失败；改用 GTK 原生对话框（file_selector_linux），
+      // 与「加载模型」的目录选择同一套实现，插件缺失时回退 file_picker
+      String? path;
+      if (Platform.isLinux) {
+        try {
+          final file = await file_selector.openFile(
+            acceptedTypeGroups: const [
+              file_selector.XTypeGroup(label: '音频文件', extensions: [
+                'wav', 'wave', 'mp3', 'm4a', 'aac', 'mp4',
+                'ogg', 'oga', 'opus', 'flac',
+              ]),
+            ],
+          );
+          path = file?.path;
+        } on MissingPluginException {
+          path = (await FilePicker.pickFile(dialogTitle: '选择音频文件'))?.path;
+        }
+      } else {
+        path = (await FilePicker.pickFile(dialogTitle: '选择音频文件'))?.path;
+      }
       if (path != null && path.isNotEmpty) await setFile(path);
     } catch (e) {
       error = '选择文件失败：$e';

@@ -3,6 +3,7 @@ import 'dart:io';
 
 import 'package:audioplayers/audioplayers.dart';
 import 'package:file_picker/file_picker.dart';
+import 'package:file_selector/file_selector.dart' as file_selector;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -297,7 +298,8 @@ const MethodChannel _macSavePanel = MethodChannel('voxdesk/save_panel');
 
 /// 弹出保存对话框，返回所选目标路径（用户取消返回 null）；不写入内容，
 /// 由调用方自行落盘。
-Future<Uri?> _saveFileDialog({
+Future<Uri?> _saveFileDialog(
+  BuildContext context, {
   required String fileName,
   String? dialogTitle,
 }) async {
@@ -307,6 +309,44 @@ Future<Uri?> _saveFileDialog({
       'dialogTitle': dialogTitle,
     });
     return path == null || path.isEmpty ? null : Uri.file(path);
+  }
+  if (Platform.isLinux) {
+    // file_picker 的 Linux 实现直连 xdg-desktop-portal（D-Bus），离网或未装
+    // portal 的系统直接抛 ServiceUnknown、导出全部失败；改用 GTK 原生对话框
+    // （file_selector_linux）：GtkFileChooserNative 只在沙箱环境才走 portal，
+    // 普通桌面直接弹本地对话框，不依赖任何系统服务
+    final location = await file_selector.getSaveLocation(
+      suggestedName: fileName,
+      confirmButtonText: '导出',
+    );
+    if (location == null) return null;
+    final path = location.path;
+    // GTK 该对话框默认不做覆盖确认，避免静默覆盖已有文件
+    if (File(path).existsSync()) {
+      final overwrite = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: Text(
+            '文件已存在',
+            style: const TextStyle(fontSize: 15.5, fontWeight: FontWeight.w700),
+          ),
+          contentPadding: const EdgeInsets.fromLTRB(22, 14, 22, 0),
+          content: Text('「$fileName」已存在，确定覆盖吗？'),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('取消'),
+            ),
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('覆盖', style: TextStyle(color: AppColors.primary)),
+            ),
+          ],
+        ),
+      );
+      if (overwrite != true) return null;
+    }
+    return Uri.file(path);
   }
   return FilePicker.saveFile(
     dialogTitle: dialogTitle,
@@ -329,6 +369,7 @@ Future<void> exportAudio(
     // 先取目标路径、再流式拷贝：saveFile(bytes) 要求整份内容驻留内存，
     // 长会话录音可达数百 MB，与识别引擎并存时易失败
     uri = await _saveFileDialog(
+      context,
       fileName: '$defaultName.$ext',
       dialogTitle: '导出音频',
     );
@@ -362,6 +403,7 @@ Future<void> exportDocx(
       durationSec: durationSec,
     );
     uri = await _saveFileDialog(
+      context,
       fileName: '$defaultName.docx',
       dialogTitle: '导出转写文档',
     );

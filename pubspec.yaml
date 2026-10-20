@@ -2,7 +2,7 @@ name: voxdesk
 description: "离线语音工作台（sherpa-onnx + FireRedAsr2 + Silero VAD + Pyannote + 3D-Speaker）"
 publish_to: 'none'
 
-version: 1.0.6+1
+version: 1.0.7+1
 
 environment:
   sdk: ^3.13.3
