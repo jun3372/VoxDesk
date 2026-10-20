@@ -216,6 +216,10 @@ class UploadController extends ChangeNotifier {
     notifyListeners();
 
     final sw = Stopwatch()..start();
+    // 段落识别失败统计：全部失败时不能让界面误报「转写完成」（导出
+    // 按钮全灰却无任何提示），完成后统一判定上浮
+    var recognizeFailures = 0;
+    Object? lastRecognizeError;
     // 说话人标注开关在转写开始时快照，转写过程中不响应选项变化
     final diarize = useDiarization;
     // 未启动时为 null；已启动时元素为 null 表示分离失败（等同无标签）
@@ -296,8 +300,23 @@ class UploadController extends ChangeNotifier {
           _updateEta(sw, ratio, 0.9);
         },
         onChanged: notifyListeners,
+        onSegmentError: (e) {
+          recognizeFailures++;
+          lastRecognizeError = e;
+        },
       );
       feedDone = true;
+
+      // 识别走完却一条结果都没有：区分「识别失败」与「没有语音内容」，
+      // 回到已选文件态并提示，避免显示转写完成、导出按钮全灰
+      if (segments.isEmpty && !_cancelRequested) {
+        phase = UploadPhase.fileSelected;
+        error = recognizeFailures > 0
+            ? '识别失败：$lastRecognizeError'
+            : '未在音频中识别到语音内容，请确认音源后重试';
+        stageLabel = '';
+        return;
+      }
 
       // —— 识别完成后再跑说话人分离（与识别串行，见前述说明）——
       final diarUsable =

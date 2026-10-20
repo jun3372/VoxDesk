@@ -102,6 +102,11 @@ class RealtimeController extends ChangeNotifier {
   Timer? _ticker;
   int _totalSamples = 0;
 
+  /// 录音中逐句识别失败统计：结束时全部失败/零结果时据此上浮提示，
+  /// 避免界面误报「转写完成」、导出按钮全灰却无任何原因说明。
+  int _recognizeFailures = 0;
+  Object? _lastRecognizeError;
+
   /// 录音分片边录边落盘：草稿目录在会话开始时创建，session.wav
   /// 由 [_writer] 流式追加，常驻内存不随会话时长增长。
   RealtimeSessionDraft? _draft;
@@ -158,6 +163,8 @@ class RealtimeController extends ChangeNotifier {
     _incrDiarMarkSec = 0;
     _lastIncrDiarCostSec = 0;
     liveDiarizing = false;
+    _recognizeFailures = 0;
+    _lastRecognizeError = null;
     _sessionDiarize = useDiarization;
     final started = DateTime.now();
     try {
@@ -233,6 +240,14 @@ class RealtimeController extends ChangeNotifier {
       }
       await _queue;
       _vad.free();
+
+      // 整场录音没有产出任何文字：区分识别失败与无语音，避免界面
+      // 误报「转写完成」、导出按钮全灰却无原因说明
+      if (segments.isEmpty) {
+        error = _recognizeFailures > 0
+            ? '识别失败：$_lastRecognizeError'
+            : '本次录音未识别到语音内容';
+      }
 
       endedDurationSec = _totalSamples / VadEngine.sampleRate;
 
@@ -463,6 +478,8 @@ class RealtimeController extends ChangeNotifier {
     // （两者并行会因内存带宽互踩导致转写结果长时间停更）
     // 说话人标注开关在开始时快照
     final diarize = useDiarization;
+    var recognizeFailures = 0;
+    Object? lastRecognizeError;
     Future<List<DiarSegment>?>? diarFuture;
     var feedDone = false;
     // 分离结果已就绪；此后已识别段落立即打标、新段落即时回填
@@ -539,8 +556,21 @@ class RealtimeController extends ChangeNotifier {
           _updateRetranscribeEta(sw, ratio);
         },
         onChanged: notifyListeners,
+        onSegmentError: (e) {
+          recognizeFailures++;
+          lastRecognizeError = e;
+        },
       );
       feedDone = true;
+
+      // 与上传转写一致：零结果时上浮原因，不误报转写完成
+      if (segments.isEmpty && !_retranscribeCancel) {
+        error = recognizeFailures > 0
+            ? '识别失败：$lastRecognizeError'
+            : '录音中未识别到语音内容';
+        stageLabel = '';
+        return;
+      }
 
       // —— 识别完成后再跑说话人分离（与识别串行）——
       final diarUsable = diarize &&
@@ -712,6 +742,8 @@ class RealtimeController extends ChangeNotifier {
           }
         } catch (e) {
           debugPrint('实时识别失败: $e');
+          _recognizeFailures++;
+          _lastRecognizeError = e;
         }
         recognizing = false;
         notifyListeners();

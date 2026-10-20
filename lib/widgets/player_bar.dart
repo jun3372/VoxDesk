@@ -290,6 +290,31 @@ void copyText(BuildContext context, String text) {
   );
 }
 
+/// macOS 原生保存面板（MainFlutterWindow.swift 内 SavePanelPlugin）：
+/// file_picker 的 NSSavePanel 固定隐藏扩展名，对话框里默认文件名看不到
+/// 后缀；Windows/Linux 的 file_picker 无此问题，维持原实现。
+const MethodChannel _macSavePanel = MethodChannel('voxdesk/save_panel');
+
+/// 弹出保存对话框，返回所选目标路径（用户取消返回 null）；不写入内容，
+/// 由调用方自行落盘。
+Future<Uri?> _saveFileDialog({
+  required String fileName,
+  String? dialogTitle,
+}) async {
+  if (Platform.isMacOS) {
+    final path = await _macSavePanel.invokeMethod<String>('save', {
+      'fileName': fileName,
+      'dialogTitle': dialogTitle,
+    });
+    return path == null || path.isEmpty ? null : Uri.file(path);
+  }
+  return FilePicker.saveFile(
+    dialogTitle: dialogTitle,
+    fileName: fileName,
+    bytes: Uint8List(0),
+  );
+}
+
 /// 导出音频文件（保存对话框，按原始格式保存）。
 Future<void> exportAudio(
   BuildContext context,
@@ -299,21 +324,22 @@ Future<void> exportAudio(
   final ext = sourcePath.contains('.')
       ? sourcePath.split('.').last.toLowerCase()
       : 'wav';
-  final Uint8List bytes;
+  Uri? uri;
   try {
-    bytes = await File(sourcePath).readAsBytes();
+    // 先取目标路径、再流式拷贝：saveFile(bytes) 要求整份内容驻留内存，
+    // 长会话录音可达数百 MB，与识别引擎并存时易失败
+    uri = await _saveFileDialog(
+      fileName: '$defaultName.$ext',
+      dialogTitle: '导出音频',
+    );
+    if (uri != null) await File(sourcePath).copy(uri.toFilePath());
   } catch (e) {
     if (context.mounted) {
       ScaffoldMessenger.of(context)
-          .showSnackBar(SnackBar(content: Text('读取音频文件失败：$e')));
+          .showSnackBar(SnackBar(content: Text('导出音频失败：$e')));
     }
     return;
   }
-  final uri = await FilePicker.saveFile(
-    dialogTitle: '导出音频',
-    fileName: '$defaultName.$ext',
-    bytes: bytes,
-  );
   if (uri == null || context.mounted == false) return;
   ScaffoldMessenger.of(context)
       .showSnackBar(SnackBar(content: Text('已导出到 ${uri.toFilePath()}')));
@@ -327,19 +353,31 @@ Future<void> exportDocx(
   DateTime? createdAt,
   double? durationSec,
 }) async {
-  final bytes = DocxExporter.build(
-    title: defaultName,
-    segments: segments,
-    createdAt: createdAt,
-    durationSec: durationSec,
-  );
-  final uri = await FilePicker.saveFile(
-    dialogTitle: '导出转写文档',
-    fileName: '$defaultName.docx',
-    mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-    bytes: bytes,
-  );
+  Uri? uri;
+  try {
+    final bytes = DocxExporter.build(
+      title: defaultName,
+      segments: segments,
+      createdAt: createdAt,
+      durationSec: durationSec,
+    );
+    uri = await _saveFileDialog(
+      fileName: '$defaultName.docx',
+      dialogTitle: '导出转写文档',
+    );
+    if (uri != null) {
+      await File(uri.toFilePath()).writeAsBytes(bytes, flush: true);
+    }
+  } catch (e) {
+    // 目标文件被占用（如已在 Word 中打开同名文件）、权限不足等插件
+    // 内部异常若不上浮提示，表现为「点击导出无任何反应」
+    if (context.mounted) {
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text('导出文档失败：$e')));
+    }
+    return;
+  }
   if (uri == null || context.mounted == false) return;
   ScaffoldMessenger.of(context)
-      .showSnackBar(SnackBar(content: Text('已导出到 $uri')));
+      .showSnackBar(SnackBar(content: Text('已导出到 ${uri.toFilePath()}')));
 }
